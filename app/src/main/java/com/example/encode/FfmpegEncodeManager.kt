@@ -175,8 +175,6 @@ object FfmpegEncodeManager {
             // Phase 3: Setup Fonts & Generate ASS Subtitle File
             _encodeState.update { it.copy(currentPhaseText = "Fontlar ve altyazı hazırlanıyor...") }
 
-            val fontsDir = FontSetupHelper.setupFonts(context, customFontFile)
-
             val videoWidth = if (sourceMetadata.width > 0) sourceMetadata.width else 1920
             val videoHeight = if (sourceMetadata.height > 0) sourceMetadata.height else 1080
             val assContent = AssGenerator.generateAss(
@@ -187,6 +185,23 @@ object FfmpegEncodeManager {
                 videoWidth = videoWidth,
                 videoHeight = videoHeight,
                 additionalStyles = additionalStyles
+            )
+
+            // Extract all font names referenced across styles, cues, and settings
+            val allCustomFonts = FontManager.getAllCustomFonts(context)
+            val extractedAssNames = FontSetupHelper.extractAllReferencedFontNames(assContent, additionalStyles)
+            val allReferencedNames = mutableSetOf<String>()
+            allReferencedNames.addAll(extractedAssNames)
+            if (style.fontName.isNotBlank()) allReferencedNames.add(style.fontName)
+            customFontFile?.let { allReferencedNames.add(it.nameWithoutExtension) }
+
+            val encodeFontsDir = File(cacheWorkingDir, "fonts")
+            val fontsDir = FontSetupHelper.setupFonts(
+                context = context,
+                targetFontsDir = encodeFontsDir,
+                customFontFile = customFontFile,
+                additionalCustomFonts = allCustomFonts,
+                referencedFontNames = allReferencedNames
             )
 
             val assFile = File(cacheWorkingDir, "sub_${System.currentTimeMillis()}.ass")
@@ -212,12 +227,25 @@ object FfmpegEncodeManager {
 
             val escapedAssPath = escapeForAssFilter(assFile.absolutePath)
             val escapedFontsDirPath = escapeForAssFilter(fontsDir.absolutePath)
-            val vfArg = "ass='${escapedAssPath}':fontsdir='${escapedFontsDirPath}'"
+            var vfArg = "ass='${escapedAssPath}':fontsdir='${escapedFontsDirPath}'"
 
-            val crf = settings.crf.coerceIn(16, 28)
+            // Apply resolution scaling if requested
+            val targetHeight = when (settings.resolution) {
+                "1080p" -> 1080
+                "720p" -> 720
+                "480p" -> 480
+                "360p" -> 360
+                else -> 0
+            }
+            if (targetHeight > 0) {
+                vfArg += ",scale=-2:$targetHeight"
+            }
+
+            val crf = settings.crf.coerceIn(14, 28)
             val preset = settings.preset.ifBlank { "veryfast" }
 
-            val isAudioCopyable = isCodecMp4Compatible(sourceMetadata.audioCodec)
+            val wantsOriginalAudio = settings.audioOption.startsWith("Orijinal", ignoreCase = true)
+            val isAudioCopyable = wantsOriginalAudio && isCodecMp4Compatible(sourceMetadata.audioCodec)
 
             var encodeSession = executeFfmpegSession(
                 inputVideoFile = inputVideoFile,
@@ -396,15 +424,29 @@ object FfmpegEncodeManager {
         args.add("-c:v")
         args.add(videoEncoderName)
 
+        // FPS control
+        if (settings.fps != "Kaynakla Aynı" && settings.fps.isNotBlank()) {
+            val fpsVal = settings.fps.toDoubleOrNull()
+            if (fpsVal != null && fpsVal > 0) {
+                args.add("-r")
+                args.add(settings.fps)
+            }
+        }
+
         if (videoEncoderName == "libx264" || videoEncoderName == "libx265") {
             args.add("-preset")
             args.add(preset)
-            args.add("-crf")
-            args.add(crf.toString())
+            if (settings.bitrate != "Otomatik" && settings.bitrate.isNotBlank()) {
+                args.add("-b:v")
+                args.add(settings.bitrate)
+            } else {
+                args.add("-crf")
+                args.add(crf.toString())
+            }
             args.add("-pix_fmt")
             args.add("yuv420p")
         } else if (videoEncoderName.contains("mediacodec")) {
-            val bitrate = if (settings.bitrate != "Otomatik") settings.bitrate else "4500k"
+            val bitrate = if (settings.bitrate != "Otomatik" && settings.bitrate.isNotBlank()) settings.bitrate else "4500k"
             args.add("-b:v")
             args.add(bitrate)
             args.add("-pix_fmt")
@@ -418,15 +460,45 @@ object FfmpegEncodeManager {
             args.add("yuv420p")
         }
 
-        if (copyAudio) {
-            args.add("-c:a")
-            args.add("copy")
-        } else {
-            args.add("-c:a")
-            args.add("aac")
-            args.add("-b:a")
-            args.add("192k")
+        // Audio stream processing based on settings
+        val audioOpt = settings.audioOption
+        when {
+            audioOpt.startsWith("Sessiz", ignoreCase = true) -> {
+                args.add("-an")
+            }
+            audioOpt.contains("320") -> {
+                args.add("-c:a")
+                args.add("aac")
+                args.add("-b:a")
+                args.add("320k")
+            }
+            audioOpt.contains("192") -> {
+                args.add("-c:a")
+                args.add("aac")
+                args.add("-b:a")
+                args.add("192k")
+            }
+            audioOpt.contains("128") -> {
+                args.add("-c:a")
+                args.add("aac")
+                args.add("-b:a")
+                args.add("128k")
+            }
+            copyAudio -> {
+                args.add("-c:a")
+                args.add("copy")
+            }
+            else -> {
+                args.add("-c:a")
+                args.add("aac")
+                args.add("-b:a")
+                args.add("192k")
+            }
         }
+
+        // Optimize MP4 container with faststart for immediate Gallery/ExoPlayer playback
+        args.add("-movflags")
+        args.add("+faststart")
 
         args.add(tempOutputFile.absolutePath)
 

@@ -78,6 +78,7 @@ import com.example.encode.EncodeState
 import com.example.encode.EncoderOption
 import com.example.encode.EncodingSettings
 import com.example.encode.HardsubEncoder
+import com.example.encode.QualityOption
 import com.example.ui.AxiSubUiState
 import java.io.File
 import java.util.Locale
@@ -291,7 +292,7 @@ private fun ReadyToEncodeContent(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // 2. Encoder Seçimi (Özet ve Geçiş)
+        // 2. Encoder ve Kalite Seçimi
         Card(
             shape = RoundedCornerShape(12.dp),
             colors = CardDefaults.cardColors(
@@ -301,6 +302,75 @@ private fun ReadyToEncodeContent(
             modifier = Modifier.fillMaxWidth()
         ) {
             Column(modifier = Modifier.padding(14.dp)) {
+                // Kalite Seçimi (Quality Options)
+                Text(
+                    text = "Kalite Seçimi",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 13.sp,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    QualityOption.values().forEach { qOpt ->
+                        FilterChip(
+                            selected = settings.qualityOption == qOpt,
+                            onClick = {
+                                if (qOpt == QualityOption.CUSTOM) {
+                                    onUpdateSettings(settings.copy(qualityOption = qOpt))
+                                } else {
+                                    onUpdateSettings(
+                                        settings.copy(
+                                            qualityOption = qOpt,
+                                            resolution = qOpt.resolution,
+                                            crf = qOpt.defaultCrf,
+                                            preset = qOpt.defaultPreset,
+                                            bitrate = qOpt.defaultBitrate,
+                                            audioOption = qOpt.defaultAudioOption
+                                        )
+                                    )
+                                }
+                            },
+                            label = {
+                                Text(
+                                    qOpt.displayName,
+                                    fontSize = 11.sp,
+                                    fontWeight = if (settings.qualityOption == qOpt) FontWeight.Bold else FontWeight.Normal
+                                )
+                            }
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(6.dp))
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(8.dp)) {
+                        Text(
+                            text = settings.qualityOption.description,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = "Çözünürlük: ${settings.resolution}  •  CRF: ${settings.crf}  •  Hız: ${settings.preset}  •  Ses: ${settings.audioOption}",
+                            fontSize = 10.sp,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f)
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+                HorizontalDivider(color = DividerDefaults.color.copy(alpha = 0.3f))
+                Spacer(modifier = Modifier.height(12.dp))
+
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -373,6 +443,60 @@ private fun ReadyToEncodeContent(
                             .padding(top = 10.dp)
                     ) {
                         HorizontalDivider(color = DividerDefaults.color.copy(alpha = 0.3f))
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        // Çözünürlük / Scale
+                        Text(
+                            text = "Çözünürlük (Scale):",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.outline
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            listOf("Kaynakla Aynı", "1080p", "720p", "480p", "360p").forEach { resOpt ->
+                                FilterChip(
+                                    selected = settings.resolution == resOpt,
+                                    onClick = { onUpdateSettings(settings.copy(resolution = resOpt, qualityOption = QualityOption.CUSTOM)) },
+                                    label = { Text(resOpt, fontSize = 11.sp) }
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        // Ses (Audio) Seçenekleri
+                        Text(
+                            text = "Ses Kalitesi / Modu:",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.outline
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            listOf(
+                                "Orijinal (Mümkünse Copy)",
+                                "AAC 320 kbps (Yüksek)",
+                                "AAC 192 kbps (Standart)",
+                                "AAC 128 kbps (Kompakt)",
+                                "Sessiz / Ses Yok"
+                            ).forEach { audOpt ->
+                                FilterChip(
+                                    selected = settings.audioOption == audOpt,
+                                    onClick = { onUpdateSettings(settings.copy(audioOption = audOpt, qualityOption = QualityOption.CUSTOM)) },
+                                    label = { Text(audOpt, fontSize = 11.sp) }
+                                )
+                            }
+                        }
+
                         Spacer(modifier = Modifier.height(10.dp))
 
                         // Encoder List Chips

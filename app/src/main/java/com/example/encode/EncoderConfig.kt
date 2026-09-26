@@ -104,17 +104,104 @@ enum class EncoderOption(
 }
 
 /**
+ * Pre-configured Quality presets mapping to optimal Resolution, CRF, Bitrate & Audio trade-offs.
+ */
+enum class QualityOption(
+    val id: String,
+    val displayName: String,
+    val resolution: String,
+    val defaultCrf: Int,
+    val defaultPreset: String,
+    val defaultBitrate: String,
+    val defaultAudioOption: String,
+    val description: String
+) {
+    ULTRA_1080P(
+        id = "ultra_1080p",
+        displayName = "1080p Ultra",
+        resolution = "1080p",
+        defaultCrf = 16,
+        defaultPreset = "slow",
+        defaultBitrate = "8000k",
+        defaultAudioOption = "AAC 320 kbps (Yüksek)",
+        description = "Maksimum görsel keskinlik & stüdyo ses kalitesi"
+    ),
+    HIGH_1080P(
+        id = "high_1080p",
+        displayName = "1080p Yüksek (Önerilen)",
+        resolution = "1080p",
+        defaultCrf = 18,
+        defaultPreset = "medium",
+        defaultBitrate = "5000k",
+        defaultAudioOption = "AAC 192 kbps (Standart)",
+        description = "En ideal görsel kalite ve dosya boyutu dengesi"
+    ),
+    STANDARD_720P(
+        id = "standard_720p",
+        displayName = "720p Standart",
+        resolution = "720p",
+        defaultCrf = 20,
+        defaultPreset = "medium",
+        defaultBitrate = "3200k",
+        defaultAudioOption = "AAC 192 kbps (Standart)",
+        description = "Mobil cihazlar ve sosyal medya için ideal"
+    ),
+    FAST_720P(
+        id = "fast_720p",
+        displayName = "720p Hızlı",
+        resolution = "720p",
+        defaultCrf = 23,
+        defaultPreset = "veryfast",
+        defaultBitrate = "2200k",
+        defaultAudioOption = "AAC 128 kbps (Kompakt)",
+        description = "Yüksek hızda hızlı render ve akıcı video"
+    ),
+    COMPACT_480P(
+        id = "compact_480p",
+        displayName = "480p Kompakt",
+        resolution = "480p",
+        defaultCrf = 25,
+        defaultPreset = "veryfast",
+        defaultBitrate = "1200k",
+        defaultAudioOption = "AAC 128 kbps (Kompakt)",
+        description = "Küçük dosya boyutu, minimum depolama"
+    ),
+    SOURCE_ORIGINAL(
+        id = "source_original",
+        displayName = "Orijinal Kalite",
+        resolution = "Kaynakla Aynı",
+        defaultCrf = 18,
+        defaultPreset = "medium",
+        defaultBitrate = "Otomatik",
+        defaultAudioOption = "Orijinal (Mümkünse Copy)",
+        description = "Videonun orijinal çözünürlük ve ses akışını korur"
+    ),
+    CUSTOM(
+        id = "custom",
+        displayName = "Özel Ayarlar",
+        resolution = "Kaynakla Aynı",
+        defaultCrf = 18,
+        defaultPreset = "medium",
+        defaultBitrate = "Otomatik",
+        defaultAudioOption = "Orijinal (Mümkünse Copy)",
+        description = "Çözünürlük, CRF, FPS ve ses parametrelerini elle belirleyin"
+    )
+}
+
+/**
  * User-selected or detected encoding settings.
  */
 data class EncodingSettings(
+    val qualityOption: QualityOption = QualityOption.HIGH_1080P,
+    val resolution: String = "1080p", // "Kaynakla Aynı", "1080p", "720p", "480p", "360p"
     val encoderOption: EncoderOption = EncoderOption.AUTO,
-    val videoCodec: String = "Otomatik", // "Otomatik", "H.264 / AVC", "H.265 / HEVC", "VP9", "AV1"
-    val crf: Int = 18, // 16 to 28 (User requested 18)
-    val preset: String = "veryfast", // ultrafast, superfast, veryfast, faster, fast, medium
-    val bitrate: String = "Otomatik", // "Otomatik", "2000k", "4000k", "6000k", "8000k", "12000k"
+    val videoCodec: String = "Otomatik", // "Otomatik", "libx264", "libx265", "h264_mediacodec", "hevc_mediacodec"
+    val crf: Int = 18, // 14 to 28
+    val preset: String = "medium", // ultrafast, superfast, veryfast, faster, fast, medium, slow, veryslow
+    val bitrate: String = "Otomatik", // "Otomatik", "1500k", "2500k", "4000k", "6000k", "8000k", "12000k"
     val fps: String = "Kaynakla Aynı", // "Kaynakla Aynı", "24", "30", "60"
-    val resolution: String = "Kaynakla Aynı", // "Kaynakla Aynı", "1080p", "720p", "480p"
-    val pixelFormat: String = "yuv420p", // "yuv420p", "nv12", "nv21", "Otomatik"
+    val audioOption: String = "AAC 192 kbps (Standart)", // "Orijinal (Mümkünse Copy)", "AAC 320 kbps (Yüksek)", "AAC 192 kbps (Standart)", "AAC 128 kbps (Kompakt)", "Sessiz / Ses Yok"
+    val pixelFormat: String = "yuv420p", // "yuv420p", "nv12", "Otomatik"
     val hardwareAcceleration: String = "Otomatik" // "Otomatik", "Zorunlu Açık", "Kapalı"
 )
 
