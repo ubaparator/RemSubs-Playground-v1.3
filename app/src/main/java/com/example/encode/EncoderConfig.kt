@@ -11,7 +11,7 @@ data class EncodeState(
     val isCompleted: Boolean = false,
     val isCancelled: Boolean = false,
     val currentPhaseText: String = "Hazır",
-    val currentEncoderName: String = "libx264 (Termux FFmpeg)",
+    val currentEncoderName: String = "libx264 (Dahili FFmpeg)",
     val progress: Float = 0f, // 0.0 to 1.0
     val progressPercentage: Int = 0, // 0 to 100
     val currentFrame: Long = 0L,

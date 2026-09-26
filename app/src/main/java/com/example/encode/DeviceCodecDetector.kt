@@ -132,22 +132,7 @@ object DeviceCodecDetector {
     suspend fun runCompatibilityTestSuite(context: Context): List<CompatibilityTestItem> = withContext(Dispatchers.IO) {
         val results = mutableListOf<CompatibilityTestItem>()
 
-        // 1. Termux Environment Check
-        val termuxInstalled = TermuxEncodeManager.isTermuxInstalled(context)
-        results.add(
-            CompatibilityTestItem(
-                title = "Termux Ortamı",
-                statusText = if (termuxInstalled) "OK (Yüklü)" else "Bulunamadı",
-                isOk = termuxInstalled,
-                details = if (termuxInstalled) {
-                    "Termux tespit edildi. Encode Al işlemi Termux FFmpeg ve libass üzerinden çalışır."
-                } else {
-                    "Termux yüklü değil. 'Encode Al' için Termux ve 'pkg install ffmpeg' gereklidir."
-                }
-            )
-        )
-
-        // 2. FFmpeg Native / System Initialization
+        // 1. Internal FFmpeg Engine Check
         val ffmpegVersion = try {
             FFmpegKitConfig.getVersion()
         } catch (t: Throwable) {
@@ -157,16 +142,16 @@ object DeviceCodecDetector {
         if (ffmpegVersion != null) {
             results.add(
                 CompatibilityTestItem(
-                    title = "FFmpeg",
+                    title = "Dahili FFmpeg Motoru",
                     statusText = "OK ($ffmpegVersion)",
                     isOk = true,
-                    details = "Native kütüphaneler başarıyla yüklendi (arm64-v8a / x86_64)."
+                    details = "Uygulamanın dahili FFmpeg motoru aktif (arm64-v8a / x86_64). Harici araç veya Termux gerekmez."
                 )
             )
         } else {
             results.add(
                 CompatibilityTestItem(
-                    title = "FFmpeg",
+                    title = "Dahili FFmpeg Motoru",
                     statusText = "Kullanılamıyor",
                     isOk = false,
                     details = "Native JNI kütüphaneleri bulunamadı."

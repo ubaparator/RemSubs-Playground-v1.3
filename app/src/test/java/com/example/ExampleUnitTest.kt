@@ -203,10 +203,17 @@ class ExampleUnitTest {
     }
 
     @Test
-    fun testFFmpegKitConfigInitialization() {
-        // Must execute without throwing NoClassDefFoundError
+    fun testFFmpegKitApiSignatures() {
+        val args = arrayOf("-version")
+        try {
+            val session = com.arthenica.ffmpegkit.FFmpegKit.executeWithArguments(args)
+            org.junit.Assert.assertNotNull(session)
+        } catch (_: Throwable) {
+            // Native Android .so libraries cannot be loaded directly in host JVM unit test environment
+        }
+
         val isAvail = com.example.encode.HardsubEncoder.isFFmpegAvailable()
-        // Result is boolean (true if native lib present, false otherwise, but never crashes)
+        // Must return safely without throwing unhandled exception
     }
 
     @Test
@@ -260,20 +267,33 @@ class ExampleUnitTest {
     }
 
     @Test
-    fun testTermuxEscapingSpecialCharactersAndTurkish() {
-        val path = "/storage/emulated/0/Movies/RemSubs/video (1) [720p] & 'özel' çşğü...mkv"
-        val bashEscaped = com.example.encode.TermuxEncodeManager.escapeForBash(path)
-        assertTrue(bashEscaped.startsWith("'"))
-        assertTrue(bashEscaped.endsWith("'"))
-        assertTrue(bashEscaped.contains("'\\''özel'\\''"))
-
-        val filterEscaped = com.example.encode.TermuxEncodeManager.escapeForAssFilter("sub:file,name['1'].ass")
+    fun testFfmpegEscapingSpecialCharactersAndTurkish() {
+        val filterEscaped = com.example.encode.FfmpegEncodeManager.escapeForAssFilter("sub:file,name['1'].ass")
         assertEquals("sub\\:file\\,name\\[\\'1\\'\\]\\.ass".replace("\\.", "."), filterEscaped)
         assertTrue(filterEscaped.contains("\\:"))
         assertTrue(filterEscaped.contains("\\,"))
         assertTrue(filterEscaped.contains("\\["))
         assertTrue(filterEscaped.contains("\\]"))
         assertTrue(filterEscaped.contains("\\'"))
+    }
+
+    @Test
+    fun testFfmpegUniqueOutputFileNaming() {
+        val tempDir = java.io.File(System.getProperty("java.io.tmpdir"), "remsubs_test_${System.currentTimeMillis()}").apply { mkdirs() }
+        try {
+            val file1 = com.example.encode.FfmpegEncodeManager.resolveUniqueOutputFile(tempDir, "video.mp4")
+            assertEquals("video_encoded.mp4", file1.name)
+            file1.createNewFile()
+
+            val file2 = com.example.encode.FfmpegEncodeManager.resolveUniqueOutputFile(tempDir, "video.mp4")
+            assertEquals("video_encoded_1.mp4", file2.name)
+            file2.createNewFile()
+
+            val file3 = com.example.encode.FfmpegEncodeManager.resolveUniqueOutputFile(tempDir, "video.mp4")
+            assertEquals("video_encoded_2.mp4", file3.name)
+        } finally {
+            tempDir.deleteRecursively()
+        }
     }
 
     @Test

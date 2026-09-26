@@ -10,41 +10,37 @@ import kotlinx.coroutines.flow.StateFlow
 import java.io.File
 
 /**
- * HardsubEncoder serves as the bridge delegating "Encode Al" execution to TermuxEncodeManager.
+ * HardsubEncoder serves as the primary API bridge delegating "Encode Al" execution
+ * to FfmpegEncodeManager using the app's internal FFmpeg + libass engine.
  *
- * The previous unreliable FFmpegKit hardsub execution has been completely disconnected.
- * Real encoding is executed inside Termux with FFmpeg libass.
+ * No external terminal, Termux, or third-party apps are used.
  */
 object HardsubEncoder {
     private const val TAG = "HardsubEncoder"
 
-    val encodeState: StateFlow<EncodeState> = TermuxEncodeManager.encodeState
+    val encodeState: StateFlow<EncodeState> = FfmpegEncodeManager.encodeState
 
     fun isFFmpegAvailable(): Boolean {
         return try {
             val version = FFmpegKitConfig.getVersion()
-            Log.d(TAG, "Native library inspection: $version")
+            Log.d(TAG, "Dahili FFmpeg sürümü: $version")
             version != null
         } catch (t: Throwable) {
-            Log.w(TAG, "FFmpeg native library check: ${t.localizedMessage}")
+            Log.w(TAG, "Dahili FFmpeg kontrolü: ${t.localizedMessage}")
             false
         }
     }
 
     fun resetState() {
-        TermuxEncodeManager.resetState()
+        FfmpegEncodeManager.resetState()
     }
 
     fun cancelEncoding(context: Context? = null) {
-        if (context != null) {
-            TermuxEncodeManager.cancelEncode(context)
-        } else {
-            TermuxEncodeManager.resetState()
-        }
+        FfmpegEncodeManager.cancelEncode()
     }
 
     /**
-     * Entry point to REAL HARDSUB encoding via Termux FFmpeg.
+     * Entry point to internal FFmpeg + libass hardsub encoding.
      */
     suspend fun startHardsubEncode(
         context: Context,
@@ -56,7 +52,7 @@ object HardsubEncoder {
         settings: EncodingSettings = EncodingSettings(),
         sourceMetadata: SourceVideoMetadata = SourceVideoMetadata()
     ) {
-        TermuxEncodeManager.startEncode(
+        FfmpegEncodeManager.startEncode(
             context = context,
             videoUri = videoUri,
             cues = cues,
@@ -74,3 +70,4 @@ object HardsubEncoder {
         return String.format("%02d:%02d", mins, secs)
     }
 }
+
