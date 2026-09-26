@@ -1,0 +1,8 @@
+{
+  "name": "RemSubs Playground",
+  "description": "Rem: Re:Zero temalı video ve .ass / .srt altyazı önizleme, senkronize etme ve özel TTF font düzenleyici",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
