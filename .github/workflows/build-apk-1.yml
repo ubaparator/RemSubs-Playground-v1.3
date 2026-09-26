@@ -5,6 +5,7 @@ on:
 
 permissions:
   contents: write
+  workflows: write
 
 jobs:
   build:
@@ -18,6 +19,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Find next workflow number
         id: next
@@ -25,14 +27,17 @@ jobs:
         run: |
           max=0
 
+          shopt -s nullglob
+
           for file in .github/workflows/build-apk-*.yml .github/workflows/build-apk-*.yaml; do
-            [ -e "$file" ] || continue
-
             name=$(basename "$file")
-            number=$(echo "$name" | sed -E 's/^build-apk-([0-9]+)\.(yml|yaml)$/\1/')
 
-            if [[ "$number" =~ ^[0-9]+$ ]] && [ "$number" -gt "$max" ]; then
-              max="$number"
+            if [[ "$name" =~ ^build-apk-([0-9]+)\.(yml|yaml)$ ]]; then
+              number="${BASH_REMATCH[1]}"
+
+              if [ "$number" -gt "$max" ]; then
+                max="$number"
+              fi
             fi
           done
 
@@ -43,16 +48,17 @@ jobs:
 
           echo "Next workflow: build-apk-$next.yml"
 
-      - name: Copy this workflow with next number
+      - name: Create next workflow
         shell: bash
         run: |
-          NEXT_FILE="${{ steps.next.outputs.next_file }}"
+          CURRENT=".github/workflows/build-apk-1.yml"
+          NEXT=".github/workflows/build-apk-${{ steps.next.outputs.next_number }}.yml"
 
-          cp ".github/workflows/build-apk-1.yml" "$NEXT_FILE"
+          cp "$CURRENT" "$NEXT"
 
           sed -i \
             "s/name: Build APK 1/name: Build APK ${{ steps.next.outputs.next_number }}/" \
-            "$NEXT_FILE"
+            "$NEXT"
 
       - name: Commit next workflow
         shell: bash
@@ -63,12 +69,11 @@ jobs:
           git add ".github/workflows/build-apk-${{ steps.next.outputs.next_number }}.yml"
 
           git commit \
-            -m "Add build workflow ${{ steps.next.outputs.next_number }}" \
-            || echo "Nothing to commit"
+            -m "Add build workflow ${{ steps.next.outputs.next_number }}"
 
-          git push
+          git push origin main
 
-      - name: Remove workflow files from build workspace
+      - name: Remove workflows from build workspace
         shell: bash
         run: |
           rm -rf .github/workflows
@@ -108,9 +113,7 @@ jobs:
             --info
 
       - name: Find APK
-        shell: bash
         run: |
-          echo "APK files:"
           find app/build/outputs/apk -type f -name "*.apk" -print
 
       - name: Upload APK
