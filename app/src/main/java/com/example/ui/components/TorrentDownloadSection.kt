@@ -36,6 +36,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -50,6 +51,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.torrent.TorrentDownloadInfo
+import com.example.torrent.TorrentErrorType
 import com.example.torrent.TorrentState
 import java.io.File
 
@@ -436,6 +438,23 @@ fun TorrentDownloadSection(
                         }
 
                         Spacer(modifier = Modifier.height(6.dp))
+                        val errType = downloadInfo.errorType
+                        if (errType != null) {
+                            Surface(
+                                shape = RoundedCornerShape(4.dp),
+                                color = MaterialTheme.colorScheme.errorContainer,
+                                modifier = Modifier.padding(bottom = 6.dp)
+                            ) {
+                                Text(
+                                    text = "Neden: ${errType.displayTurkish}",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.onErrorContainer,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
+
                         Text(
                             text = downloadInfo.errorMessage ?: "Bilinmeyen bir hata oluştu.",
                             fontSize = 12.sp,

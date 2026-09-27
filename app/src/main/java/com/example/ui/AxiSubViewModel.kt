@@ -41,6 +41,7 @@ data class AxiSubUiState(
     val subtitleFileName: String? = null,
     val activeCues: List<SubtitleCue> = emptyList(),
     val subtitleStyle: SubtitleStyle = SubtitleStyle(),
+    val additionalStyles: List<String> = emptyList(),
     val loadedFontFamily: FontFamily? = null,
     val customFontName: String? = null,
     val selectedTab: Int = 0, // 0: Altyazı Listesi, 1: Font & Biçim, 2: Video Bilgisi
@@ -91,14 +92,20 @@ class AxiSubViewModel(application: Application) : AndroidViewModel(application) 
     private fun generateAssString(
         subtitles: List<SubtitleCue>,
         style: SubtitleStyle,
-        title: String? = null
+        title: String? = null,
+        additionalStyles: List<String> = _uiState.value.additionalStyles
     ): String {
         val name = title ?: _uiState.value.subtitleFileName ?: "remsubs_altyazi.ass"
+        val vidWidth = _uiState.value.sourceVideoMetadata.width.let { if (it > 0) it else 1920 }
+        val vidHeight = _uiState.value.sourceVideoMetadata.height.let { if (it > 0) it else 1080 }
         return AssGenerator.generateAss(
             title = name,
             subtitles = subtitles,
             style = style,
-            applyTimeOffset = false
+            applyTimeOffset = false,
+            videoWidth = vidWidth,
+            videoHeight = vidHeight,
+            additionalStyles = additionalStyles
         )
     }
 
@@ -107,6 +114,8 @@ class AxiSubViewModel(application: Application) : AndroidViewModel(application) 
             _uiState.update { it.copy(isLoading = true, errorMessage = null) }
             val demoAss = SubtitleParser.getSampleAssContent()
             val parsedCues = SubtitleParser.parseAss(demoAss)
+            val demoStyles = SubtitleParser.extractAssStyles(demoAss)
+            val demoDefaultStyle = SubtitleParser.parseAssDefaultStyle(demoAss) ?: SubtitleStyle()
 
             // Use bundled local sample video in raw resources (offline & error-free)
             val context = getApplication<Application>()
@@ -119,6 +128,8 @@ class AxiSubViewModel(application: Application) : AndroidViewModel(application) 
                     subtitles = parsedCues,
                     subtitleFileName = "ornek_demo.ass",
                     generatedAssContent = demoAss,
+                    additionalStyles = demoStyles,
+                    subtitleStyle = demoDefaultStyle,
                     wasConvertedFromSrt = false,
                     isHardsubVideoPlaying = false,
                     isLoading = false,
@@ -158,32 +169,58 @@ class AxiSubViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun updateVideoDimensions(width: Int, height: Int) {
+        if (width > 0 && height > 0) {
+            _uiState.update {
+                if (it.sourceVideoMetadata.width != width || it.sourceVideoMetadata.height != height) {
+                    it.copy(
+                        sourceVideoMetadata = it.sourceVideoMetadata.copy(
+                            width = width,
+                            height = height
+                        )
+                    )
+                } else it
+            }
+        }
+    }
+
     fun loadSubtitleFromUri(uri: Uri) {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
             val context = getApplication<Application>()
             try {
                 val fileName = FontManager.getFileName(context, uri) ?: "altyazi.ass"
-                val inputStream = context.contentResolver.openInputStream(uri)
-                if (inputStream != null) {
-                    val cues = SubtitleParser.parse(inputStream, fileName)
+                val rawContent = context.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }?.removePrefix("\uFEFF")
+                if (rawContent != null) {
+                    val cues = SubtitleParser.parse(rawContent.byteInputStream(Charsets.UTF_8), fileName)
                     val isSrt = fileName.lowercase().endsWith(".srt")
                     val targetFileName = if (isSrt) {
                         fileName.replace(Regex("(?i)\\.srt$"), ".ass")
                     } else {
                         fileName
                     }
-                    val currentStyle = _uiState.value.subtitleStyle
-                    val assContent = AssGenerator.generateAss(
-                        title = targetFileName,
-                        subtitles = cues,
-                        style = currentStyle
-                    )
+                    val additionalStyles = if (!isSrt) SubtitleParser.extractAssStyles(rawContent) else emptyList()
+                    val parsedDefaultStyle = if (!isSrt) SubtitleParser.parseAssDefaultStyle(rawContent) else null
+                    val effectiveStyle = parsedDefaultStyle ?: _uiState.value.subtitleStyle
+
+                    val assContent = if (!isSrt && rawContent.contains("[Events]")) {
+                        rawContent
+                    } else {
+                        generateAssString(
+                            subtitles = cues,
+                            style = effectiveStyle,
+                            title = targetFileName,
+                            additionalStyles = additionalStyles
+                        )
+                    }
+
                     _uiState.update {
                         it.copy(
                             subtitles = cues,
                             subtitleFileName = targetFileName,
                             generatedAssContent = assContent,
+                            additionalStyles = additionalStyles,
+                            subtitleStyle = effectiveStyle,
                             wasConvertedFromSrt = isSrt,
                             isLoading = false,
                             statusMessage = if (isSrt) {
@@ -544,7 +581,11 @@ class AxiSubViewModel(application: Application) : AndroidViewModel(application) 
             val f = File(path)
             if (f.exists()) f else null
         }
-        val additionalStyles = SubtitleParser.extractAssStyles(state.generatedAssContent)
+        val additionalStyles = if (state.additionalStyles.isNotEmpty()) {
+            state.additionalStyles
+        } else {
+            SubtitleParser.extractAssStyles(state.generatedAssContent)
+        }
 
         viewModelScope.launch(Dispatchers.IO) {
             try {

@@ -122,7 +122,7 @@ object FfmpegEncodeManager {
 
         try {
             // Determine video encoder name
-            val videoEncoderName = resolveVideoEncoderName(settings)
+            val videoEncoderName = resolveVideoEncoderName(settings, sourceMetadata)
 
             // Phase 1: Preparation
             _encodeState.update {
@@ -261,6 +261,34 @@ object FfmpegEncodeManager {
                 startTimeMs = startTimeMs
             )
 
+            var effectiveEncoderName = videoEncoderName
+
+            // If hardware MediaCodec encoder failed, automatically fallback to universal libx264 software encoder
+            if (effectiveEncoderName.contains("mediacodec") && !ReturnCode.isSuccess(encodeSession.returnCode) && !isCancelledByUser) {
+                Log.w(TAG, "Hardware encoder ($effectiveEncoderName) failed, automatically falling back to software libx264...")
+                if (tempOutput.exists()) tempOutput.delete()
+                effectiveEncoderName = "libx264"
+                _encodeState.update {
+                    it.copy(
+                        currentEncoderName = "libx264 (Yazılım Fallback)",
+                        currentPhaseText = "libx264 ile yeniden deneniyor..."
+                    )
+                }
+                encodeSession = executeFfmpegSession(
+                    inputVideoFile = inputVideoFile,
+                    vfArg = vfArg,
+                    tempOutputFile = tempOutput,
+                    videoEncoderName = "libx264",
+                    preset = preset,
+                    crf = crf,
+                    settings = settings,
+                    copyAudio = isAudioCopyable,
+                    totalFrames = activeTotalFrames,
+                    totalDurationMs = activeTotalDurationMs,
+                    startTimeMs = startTimeMs
+                )
+            }
+
             // If audio copy failed due to container incompatibility, retry once with AAC re-encode
             if (isAudioCopyable && !ReturnCode.isSuccess(encodeSession.returnCode) && !isCancelledByUser) {
                 val logs = encodeSession.allLogsAsString ?: fullLogBuffer.toString()
@@ -275,7 +303,7 @@ object FfmpegEncodeManager {
                         inputVideoFile = inputVideoFile,
                         vfArg = vfArg,
                         tempOutputFile = tempOutput,
-                        videoEncoderName = videoEncoderName,
+                        videoEncoderName = effectiveEncoderName,
                         preset = preset,
                         crf = crf,
                         settings = settings,
@@ -590,8 +618,12 @@ object FfmpegEncodeManager {
         }
     }
 
-    private fun resolveVideoEncoderName(settings: EncodingSettings): String {
+    private fun resolveVideoEncoderName(settings: EncodingSettings, sourceMetadata: SourceVideoMetadata): String {
         return when (settings.encoderOption) {
+            EncoderOption.AUTO -> {
+                val (opt, name) = DeviceCodecDetector.resolveBestEncoder(settings, sourceMetadata)
+                name
+            }
             EncoderOption.MEDIA_CODEC_H264 -> "h264_mediacodec"
             EncoderOption.MEDIA_CODEC_H265 -> "hevc_mediacodec"
             EncoderOption.LIBX265 -> "libx265"

@@ -15,6 +15,20 @@ enum class TorrentState(val displayTurkish: String) {
     ERROR("Hata")
 }
 
+enum class TorrentErrorType(val code: String, val displayTurkish: String) {
+    METADATA_TIMEOUT("METADATA_TIMEOUT", "Metadata zaman aşımı (Tracker/Peer yanıt vermedi)"),
+    NO_PEERS("NO_PEERS", "Kullanılabilir eş (peer) veya seeder bulunamadı"),
+    TRACKER_ERROR("TRACKER_ERROR", "İzleyici (Tracker) bağlantı hatası"),
+    DHT_ERROR("DHT_ERROR", "DHT ağı yanıt vermedi"),
+    PERMISSION("PERMISSION", "Depolama yazma izni reddedildi"),
+    STORAGE_FULL("STORAGE_FULL", "Cihaz depolama alanı yetersiz"),
+    INVALID_TORRENT("INVALID_TORRENT", "Geçersiz veya bozuk .torrent dosyası"),
+    INVALID_MAGNET("INVALID_MAGNET", "Geçersiz veya desteklenmeyen Magnet URI"),
+    NETWORK_ERROR("NETWORK_ERROR", "Ağ bağlantısı hatası"),
+    ENGINE_INIT_FAILURE("ENGINE_INIT_FAILURE", "Torrent motoru başlatılamadı"),
+    UNKNOWN("UNKNOWN", "Bilinmeyen torrent hatası")
+}
+
 data class TorrentDownloadInfo(
     val magnetUri: String = "",
     val torrentName: String = "Torrent İndirmesi",
@@ -33,7 +47,8 @@ data class TorrentDownloadInfo(
     val connectedPeers: Int = 0,
     val downloadedFile: File? = null,
     val permanentUri: Uri? = null,
-    val errorMessage: String? = null
+    val errorMessage: String? = null,
+    val errorType: TorrentErrorType? = null
 ) {
     fun formatDownloadedSize(): String {
         return "${formatBytes(downloadedBytes)} / ${if (totalBytes > 0) formatBytes(totalBytes) else "Hesaplanıyor..."}"

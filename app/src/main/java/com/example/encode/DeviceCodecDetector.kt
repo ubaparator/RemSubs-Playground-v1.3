@@ -45,6 +45,29 @@ object DeviceCodecDetector {
         return cachedMediaCodecH265
     }
 
+    /**
+     * Checks whether an EncoderOption is supported on this device.
+     * Software encoders (AUTO, libx264, libx265, VP9, AV1) are supported via internal FFmpegKit.
+     * Hardware encoders (MediaCodec H.264 / HEVC) require hardware encoder support on the device.
+     */
+    fun isOptionSupported(opt: EncoderOption): Boolean {
+        return when (opt) {
+            EncoderOption.AUTO -> true
+            EncoderOption.LIBX264 -> true
+            EncoderOption.MEDIA_CODEC_H264 -> {
+                val cap = getMediaCodecH264Capability()
+                cap != null && cap.isUsable && cap.isHardware
+            }
+            EncoderOption.MEDIA_CODEC_H265 -> {
+                val cap = getMediaCodecH265Capability()
+                cap != null && cap.isUsable && cap.isHardware
+            }
+            EncoderOption.LIBX265 -> true
+            EncoderOption.VP9 -> true
+            EncoderOption.AV1 -> true
+        }
+    }
+
     private fun queryCodecCapability(mimeType: String): CodecCapability? {
         try {
             val codecList = MediaCodecList(MediaCodecList.REGULAR_CODECS)

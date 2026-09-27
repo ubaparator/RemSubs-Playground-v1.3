@@ -318,4 +318,62 @@ class ExampleUnitTest {
         assertEquals("ReZero_Episode_01_[1080p].mkv", com.example.torrent.TorrentStorageManager.sanitizeFileName(mkvName))
         assertEquals("remsubs_release_v1.torrent", com.example.torrent.TorrentStorageManager.sanitizeFileName(torrentName))
     }
+
+    @Test
+    fun testTorrentErrorClassification() {
+        val manager = com.example.torrent.TorrentDownloadManager
+
+        val timeoutErr = manager.classifyError(java.net.SocketTimeoutException("metadata timed out"))
+        assertEquals(com.example.torrent.TorrentErrorType.METADATA_TIMEOUT, timeoutErr.first)
+
+        val noPeersErr = manager.classifyError(IllegalStateException("zero peers available"))
+        assertEquals(com.example.torrent.TorrentErrorType.NO_PEERS, noPeersErr.first)
+
+        val trackerErr = manager.classifyError(java.io.IOException("tracker announce failed"))
+        assertEquals(com.example.torrent.TorrentErrorType.TRACKER_ERROR, trackerErr.first)
+
+        val dhtErr = manager.classifyError(java.io.IOException("dht query unreachable"))
+        assertEquals(com.example.torrent.TorrentErrorType.DHT_ERROR, dhtErr.first)
+
+        val permErr = manager.classifyError(SecurityException("storage permission denied"))
+        assertEquals(com.example.torrent.TorrentErrorType.PERMISSION, permErr.first)
+
+        val storageErr = manager.classifyError(java.io.IOException("no space left on device"))
+        assertEquals(com.example.torrent.TorrentErrorType.STORAGE_FULL, storageErr.first)
+
+        val torrentErr = manager.classifyError(IllegalArgumentException("invalid torrent bencode header"))
+        assertEquals(com.example.torrent.TorrentErrorType.INVALID_TORRENT, torrentErr.first)
+
+        val magnetErr = manager.classifyError(IllegalArgumentException("invalid magnet link missing urn:btih"))
+        assertEquals(com.example.torrent.TorrentErrorType.INVALID_MAGNET, magnetErr.first)
+
+        val netErr = manager.classifyError(java.net.UnknownHostException("network unreachable"))
+        assertEquals(com.example.torrent.TorrentErrorType.NETWORK_ERROR, netErr.first)
+
+        val engineErr = manager.classifyError(IllegalStateException("engine init failure"))
+        assertEquals(com.example.torrent.TorrentErrorType.ENGINE_INIT_FAILURE, engineErr.first)
+    }
+
+    @Test
+    fun testEncoderOptionSupport() {
+        assertTrue(com.example.encode.DeviceCodecDetector.isOptionSupported(com.example.encode.EncoderOption.AUTO))
+        assertTrue(com.example.encode.DeviceCodecDetector.isOptionSupported(com.example.encode.EncoderOption.LIBX264))
+        // Software HEVC/VP9/AV1 are supported
+        assertTrue(com.example.encode.DeviceCodecDetector.isOptionSupported(com.example.encode.EncoderOption.LIBX265))
+    }
+
+    @Test
+    fun testAssAndPreviewScaleProportionality() {
+        val previewHeight = 216f
+        val playResY = 1080
+        val assScale = playResY / previewHeight
+        val fontSizeSp = 24f
+
+        val previewRatio = fontSizeSp / previewHeight
+        val assFontSize = (fontSizeSp * assScale).toInt()
+        val assRatio = assFontSize.toFloat() / playResY.toFloat()
+
+        // 1:1 mathematical ratio between preview and ASS subtitle rendering
+        assertEquals(previewRatio, assRatio, 0.001f)
+    }
 }

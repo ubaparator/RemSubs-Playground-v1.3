@@ -43,15 +43,23 @@ enum class EncoderOption(
 ) {
     AUTO(
         id = "auto",
-        displayName = "En Uyumlu (Otomatik)",
+        displayName = "AUTO",
         ffmpegName = "auto",
+        isHardware = false,
+        supportsCrf = true,
+        supportsPreset = true
+    ),
+    LIBX264(
+        id = "libx264",
+        displayName = "Software H.264",
+        ffmpegName = "libx264",
         isHardware = false,
         supportsCrf = true,
         supportsPreset = true
     ),
     MEDIA_CODEC_H264(
         id = "h264_mediacodec",
-        displayName = "MediaCodec H.264 (Donanım)",
+        displayName = "Hardware H.264",
         ffmpegName = "h264_mediacodec",
         isHardware = true,
         supportsCrf = false,
@@ -60,24 +68,16 @@ enum class EncoderOption(
     ),
     MEDIA_CODEC_H265(
         id = "hevc_mediacodec",
-        displayName = "MediaCodec H.265 / HEVC (Donanım)",
+        displayName = "Hardware HEVC",
         ffmpegName = "hevc_mediacodec",
         isHardware = true,
         supportsCrf = false,
         supportsPreset = false,
         defaultBitrate = "3200k"
     ),
-    LIBX264(
-        id = "libx264",
-        displayName = "libx264 (Yazılım / Evrensel)",
-        ffmpegName = "libx264",
-        isHardware = false,
-        supportsCrf = true,
-        supportsPreset = true
-    ),
     LIBX265(
         id = "libx265",
-        displayName = "libx265 (Yazılım / Yüksek Sıkıştırma)",
+        displayName = "Software HEVC (libx265)",
         ffmpegName = "libx265",
         isHardware = false,
         supportsCrf = true,

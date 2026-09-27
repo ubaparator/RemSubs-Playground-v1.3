@@ -1,6 +1,10 @@
 package com.example.parser
 
+import androidx.compose.ui.graphics.Color
 import com.example.model.SubtitleCue
+import com.example.model.SubtitleHorizontalAlign
+import com.example.model.SubtitleStyle
+import com.example.model.SubtitleVerticalAlign
 import java.io.InputStream
 import java.util.regex.Pattern
 
@@ -230,6 +234,160 @@ object SubtitleParser {
             }
         }
         return styles
+    }
+
+    /**
+     * Extracts PlayResX and PlayResY resolution from ASS script if declared.
+     */
+    fun extractScriptResolution(content: String): Pair<Int, Int>? {
+        var rx: Int? = null
+        var ry: Int? = null
+        for (line in content.lines()) {
+            val trimmed = line.trim()
+            if (trimmed.startsWith("PlayResX:", ignoreCase = true)) {
+                rx = trimmed.substringAfter(":").trim().toIntOrNull()
+            } else if (trimmed.startsWith("PlayResY:", ignoreCase = true)) {
+                ry = trimmed.substringAfter(":").trim().toIntOrNull()
+            }
+            if (trimmed.startsWith("[Events]", ignoreCase = true)) break
+        }
+        return if (rx != null || ry != null) {
+            Pair(rx ?: 1920, ry ?: 1080)
+        } else null
+    }
+
+    /**
+     * Parses the primary Default style from an ASS script into a SubtitleStyle object.
+     * Scales font size and margins proportionally based on PlayResY (relative to standard 216dp mobile preview height).
+     */
+    fun parseAssDefaultStyle(content: String, targetPlayResY: Int = 1080): SubtitleStyle? {
+        val scriptRes = extractScriptResolution(content)
+        val playResY = scriptRes?.second ?: targetPlayResY
+        val scale = playResY.toFloat() / 216f
+
+        var formatColumns = listOf(
+            "Name", "Fontname", "Fontsize", "PrimaryColour", "SecondaryColour",
+            "OutlineColour", "BackColour", "Bold", "Italic", "Underline",
+            "StrikeOut", "ScaleX", "ScaleY", "Spacing", "Angle",
+            "BorderStyle", "Outline", "Shadow", "Alignment", "MarginL", "MarginR", "MarginV", "Encoding"
+        )
+
+        var defaultStyleLine: String? = null
+        for (line in content.lines()) {
+            val trimmed = line.trim()
+            if (trimmed.startsWith("Format:", ignoreCase = true) &&
+                (trimmed.contains("Fontname", ignoreCase = true) || trimmed.contains("PrimaryColour", ignoreCase = true))
+            ) {
+                formatColumns = trimmed.substringAfter("Format:").trim().split(",").map { it.trim().lowercase() }
+            }
+            if (trimmed.startsWith("Style:", ignoreCase = true)) {
+                val parts = trimmed.substringAfter("Style:").trim().split(",")
+                val sName = parts.firstOrNull()?.trim() ?: ""
+                if (sName.equals("Default", ignoreCase = true) || defaultStyleLine == null) {
+                    defaultStyleLine = trimmed
+                    if (sName.equals("Default", ignoreCase = true)) break
+                }
+            }
+        }
+
+        if (defaultStyleLine == null) return null
+
+        try {
+            val parts = defaultStyleLine.substringAfter("Style:").trim().split(",").map { it.trim() }
+            val colMap = mutableMapOf<String, String>()
+            for (c in formatColumns.indices) {
+                if (c < parts.size) {
+                    colMap[formatColumns[c]] = parts[c]
+                }
+            }
+
+            val fontName = colMap["fontname"] ?: "Arial"
+            val rawFontSize = colMap["fontsize"]?.toFloatOrNull() ?: 50f
+            val fontSizeSp = (rawFontSize / scale).coerceIn(14f, 44f)
+
+            val primaryColStr = colMap["primarycolour"] ?: "&H00FFFFFF"
+            val textColor = parseAssColor(primaryColStr) ?: Color.White
+
+            val outlineColStr = colMap["outlinecolour"] ?: "&H00000000"
+            val outlineColor = parseAssColor(outlineColStr) ?: Color.Black
+
+            val backColStr = colMap["backcolour"] ?: "&H80000000"
+            val backgroundColor = parseAssColor(backColStr) ?: Color(0x99000000)
+
+            val bold = colMap["bold"]?.toIntOrNull() ?: 0
+            val italic = colMap["italic"]?.toIntOrNull() ?: 0
+            val underline = colMap["underline"]?.toIntOrNull() ?: 0
+            val borderStyle = colMap["borderstyle"]?.toIntOrNull() ?: 1
+
+            val rawOutline = colMap["outline"]?.toFloatOrNull() ?: 2.5f
+            val outlineWidth = (rawOutline / scale).coerceIn(1f, 6f)
+
+            val alignNum = colMap["alignment"]?.toIntOrNull() ?: 2
+            val (vAlign, hAlign) = when (alignNum) {
+                7 -> Pair(SubtitleVerticalAlign.TOP, SubtitleHorizontalAlign.LEFT)
+                8 -> Pair(SubtitleVerticalAlign.TOP, SubtitleHorizontalAlign.CENTER)
+                9 -> Pair(SubtitleVerticalAlign.TOP, SubtitleHorizontalAlign.RIGHT)
+                4 -> Pair(SubtitleVerticalAlign.MIDDLE, SubtitleHorizontalAlign.LEFT)
+                5 -> Pair(SubtitleVerticalAlign.MIDDLE, SubtitleHorizontalAlign.CENTER)
+                6 -> Pair(SubtitleVerticalAlign.MIDDLE, SubtitleHorizontalAlign.RIGHT)
+                1 -> Pair(SubtitleVerticalAlign.BOTTOM, SubtitleHorizontalAlign.LEFT)
+                3 -> Pair(SubtitleVerticalAlign.BOTTOM, SubtitleHorizontalAlign.RIGHT)
+                else -> Pair(SubtitleVerticalAlign.BOTTOM, SubtitleHorizontalAlign.CENTER)
+            }
+
+            val rawMarginV = colMap["marginv"]?.toFloatOrNull() ?: 40f
+            val verticalOffsetDp = (rawMarginV / scale).coerceIn(0f, 100f)
+
+            val rawMarginL = colMap["marginl"]?.toFloatOrNull() ?: 20f
+            val horizontalPaddingDp = (rawMarginL / scale).coerceIn(4f, 60f)
+
+            return SubtitleStyle(
+                fontName = fontName,
+                fontSizeSp = fontSizeSp,
+                isBold = bold != 0,
+                isItalic = italic != 0,
+                isUnderline = underline != 0,
+                textColor = textColor,
+                outlineColor = outlineColor,
+                hasOutline = rawOutline > 0,
+                outlineWidth = outlineWidth,
+                hasBackgroundBox = borderStyle == 3,
+                backgroundColor = backgroundColor,
+                verticalAlign = vAlign,
+                horizontalAlign = hAlign,
+                verticalOffsetDp = verticalOffsetDp,
+                horizontalPaddingDp = horizontalPaddingDp
+            )
+        } catch (_: Exception) {
+            return null
+        }
+    }
+
+    /**
+     * Parses ASS hex color format: &HAABBGGRR, &HBBGGRR, or decimal integer.
+     * Note: In ASS, alpha is inverted (00 = opaque, FF = transparent).
+     */
+    fun parseAssColor(colorStr: String): Color? {
+        val clean = colorStr.trim().removePrefix("&H").removePrefix("&h").removeSuffix("&")
+        val hexVal = clean.toLongOrNull(16) ?: clean.toLongOrNull() ?: return null
+
+        return try {
+            if (clean.length > 6) {
+                val a = (hexVal shr 24 and 0xFF).toInt()
+                val b = (hexVal shr 16 and 0xFF).toInt()
+                val g = (hexVal shr 8 and 0xFF).toInt()
+                val r = (hexVal and 0xFF).toInt()
+                val alpha = (255 - a).coerceIn(0, 255)
+                Color(r, g, b, alpha)
+            } else {
+                val b = (hexVal shr 16 and 0xFF).toInt()
+                val g = (hexVal shr 8 and 0xFF).toInt()
+                val r = (hexVal and 0xFF).toInt()
+                Color(r, g, b, 255)
+            }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun parseSrtTimestamp(h: String?, m: String?, s: String?, ms: String?): Long {

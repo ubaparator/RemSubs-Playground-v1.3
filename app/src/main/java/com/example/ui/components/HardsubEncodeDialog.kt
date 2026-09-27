@@ -513,10 +513,21 @@ private fun ReadyToEncodeContent(
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             EncoderOption.values().forEach { opt ->
+                                val isSupported = com.example.encode.DeviceCodecDetector.isOptionSupported(opt)
                                 FilterChip(
                                     selected = settings.encoderOption == opt,
-                                    onClick = { onUpdateSettings(settings.copy(encoderOption = opt)) },
-                                    label = { Text(opt.displayName, fontSize = 11.sp) }
+                                    onClick = {
+                                        if (isSupported) {
+                                            onUpdateSettings(settings.copy(encoderOption = opt))
+                                        }
+                                    },
+                                    enabled = isSupported,
+                                    label = {
+                                        Text(
+                                            text = if (isSupported) opt.displayName else "${opt.displayName} (Desteklenmiyor)",
+                                            fontSize = 11.sp
+                                        )
+                                    }
                                 )
                             }
                         }

@@ -72,6 +72,8 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.extractor.DefaultExtractorsFactory
 import androidx.media3.ui.PlayerView
 import com.example.model.SubtitleCue
 import com.example.ui.AxiSubUiState
@@ -93,16 +95,22 @@ fun VideoPlayerSection(
     onToggleFullscreen: () -> Unit,
     onPlayerError: (String?) -> Unit = {},
     onEditActiveCue: ((SubtitleCue) -> Unit)? = null,
+    onVideoDimensionsDetected: ((Int, Int) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
 
     val exoPlayer = remember {
-        ExoPlayer.Builder(context).build().apply {
-            playWhenReady = false
-            repeatMode = Player.REPEAT_MODE_OFF
-        }
+        val extractorsFactory = DefaultExtractorsFactory()
+            .setConstantBitrateSeekingEnabled(true)
+        val mediaSourceFactory = DefaultMediaSourceFactory(context, extractorsFactory)
+        ExoPlayer.Builder(context)
+            .setMediaSourceFactory(mediaSourceFactory)
+            .build().apply {
+                playWhenReady = false
+                repeatMode = Player.REPEAT_MODE_OFF
+            }
     }
 
     var controlsVisible by remember { mutableStateOf(true) }
@@ -162,6 +170,12 @@ fun VideoPlayerSection(
                 onSetPlaying(isPlaying)
             }
 
+            override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                if (videoSize.width > 0 && videoSize.height > 0) {
+                    onVideoDimensionsDetected?.invoke(videoSize.width, videoSize.height)
+                }
+            }
+
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_READY) {
                     val dur = exoPlayer.duration.coerceAtLeast(0L)
@@ -191,12 +205,18 @@ fun VideoPlayerSection(
         }
     }
 
+    val videoAspectRatio = if (uiState.sourceVideoMetadata.width > 0 && uiState.sourceVideoMetadata.height > 0) {
+        (uiState.sourceVideoMetadata.width.toFloat() / uiState.sourceVideoMetadata.height.toFloat()).coerceIn(0.5f, 3.0f)
+    } else {
+        16f / 9f
+    }
+
     val containerModifier = if (uiState.isFullscreen) {
         modifier.fillMaxSize().background(Color.Black)
     } else {
         modifier
             .fillMaxWidth()
-            .aspectRatio(16f / 9f)
+            .aspectRatio(videoAspectRatio)
             .background(Color.Black)
     }
 

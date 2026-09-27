@@ -65,6 +65,92 @@ object TorrentDownloadManager {
         "udp://tracker.torrent.eu.org:451/announce"
     )
 
+    fun classifyError(t: Throwable): Pair<TorrentErrorType, String> {
+        val msg = t.message ?: ""
+        val lower = msg.lowercase(Locale.ROOT)
+        return when {
+            lower.contains("timeout") || lower.contains("timed out") || lower.contains("metadata") ->
+                Pair(TorrentErrorType.METADATA_TIMEOUT, "Metadata zaman aşımı: İzleyiciler veya eşler yanıt vermedi.")
+            lower.contains("no peer") || lower.contains("empty peer") || lower.contains("zero peers") ->
+                Pair(TorrentErrorType.NO_PEERS, "Kullanılabilir eş (peer) veya seeder bulunamadı.")
+            lower.contains("tracker") ->
+                Pair(TorrentErrorType.TRACKER_ERROR, "İzleyici (tracker) bağlantı hatası: ${t.localizedMessage}")
+            lower.contains("dht") ->
+                Pair(TorrentErrorType.DHT_ERROR, "DHT ağı yanıt vermedi.")
+            lower.contains("permission") || lower.contains("eacces") || lower.contains("denied") ->
+                Pair(TorrentErrorType.PERMISSION, "Depolama yazma izni reddedildi: ${t.localizedMessage}")
+            lower.contains("space") || lower.contains("full") || lower.contains("enospc") ->
+                Pair(TorrentErrorType.STORAGE_FULL, "Cihaz depolama alanı yetersiz.")
+            lower.contains("bencode") || lower.contains("invalid torrent") || lower.contains("torrent file") ->
+                Pair(TorrentErrorType.INVALID_TORRENT, "Geçersiz veya bozuk .torrent dosyası.")
+            lower.contains("magnet") || lower.contains("urn:btih") ->
+                Pair(TorrentErrorType.INVALID_MAGNET, "Geçersiz veya desteklenmeyen Magnet bağlantısı.")
+            lower.contains("connect") || lower.contains("network") || lower.contains("unreachable") || lower.contains("route") ->
+                Pair(TorrentErrorType.NETWORK_ERROR, "Ağ bağlantısı hatası: İnternet erişiminizi kontrol edin.")
+            lower.contains("init") || lower.contains("engine") || lower.contains("session") ->
+                Pair(TorrentErrorType.ENGINE_INIT_FAILURE, "Torrent motoru başlatılamadı: ${t.localizedMessage}")
+            else ->
+                Pair(TorrentErrorType.UNKNOWN, "İndirme hatası: ${t.localizedMessage ?: "Bilinmeyen hata"}")
+        }
+    }
+
+    private fun logTorrentSnapshot(
+        stateOverride: String? = null,
+        errorOverride: String? = null
+    ) {
+        val info = _downloadInfo.value
+        val uri = info.magnetUri
+        val file = activeTargetFileName.ifBlank { activeOutputFile?.name ?: "" }
+        val metadataReceived = (info.state != TorrentState.RESOLVING_METADATA && info.state != TorrentState.IDLE)
+        val torrentId = info.infoHashHex
+        val totalSize = info.totalBytes
+        val downloadedSize = info.downloadedBytes
+        val downloadSpeed = info.speedText
+        val peerCount = info.connectedPeers
+        val seedCount = info.seeders
+        val completionPct = info.progressPercentage
+        val state = stateOverride ?: info.state.name
+        val error = errorOverride ?: info.errorMessage
+        val finalPath = activeOutputFile?.absolutePath ?: "Pending"
+
+        Log.d(TAG, """
+            --- TORRENT STATUS SNAPSHOT ---
+            TORRENT URI: $uri
+            TORRENT FILE: $file
+            METADATA RECEIVED: $metadataReceived
+            TORRENT ID: $torrentId
+            TOTAL SIZE: $totalSize (${TorrentDownloadInfo.formatBytes(totalSize)})
+            DOWNLOADED SIZE: $downloadedSize (${TorrentDownloadInfo.formatBytes(downloadedSize)})
+            DOWNLOAD SPEED: $downloadSpeed
+            PEER COUNT: $peerCount
+            SEED COUNT: $seedCount
+            COMPLETION %: $completionPct%
+            STATE: $state
+            ERROR: ${error ?: "None"}
+            FINAL PATH: $finalPath
+            -------------------------------
+        """.trimIndent())
+
+        if (state == TorrentState.DOWNLOADING.name || state == TorrentState.TRANSFERRING.name) {
+            val pctFloat = info.progress * 100f
+            Log.i(TAG, """
+                [TORRENT]
+                state=$state
+                progress=${String.format(Locale.US, "%.1f%%", pctFloat)}
+                downloadSpeed=$downloadSpeed
+                peers=$peerCount
+                seeds=$seedCount
+            """.trimIndent())
+        } else if (state == TorrentState.COMPLETED.name) {
+            Log.i(TAG, """
+                [TORRENT]
+                state=COMPLETED
+                path=$finalPath
+                size=$totalSize
+            """.trimIndent())
+        }
+    }
+
     fun startMagnetDownload(context: Context, magnetUri: String) {
         cancelDownload()
         isPaused = false
@@ -76,16 +162,20 @@ object TorrentDownloadManager {
                     state = TorrentState.RESOLVING_METADATA,
                     statusMessage = "Magnet bağlantısı çözümleniyor..."
                 )
+                logTorrentSnapshot(stateOverride = TorrentState.RESOLVING_METADATA.name)
 
                 // 1. Parse magnet link
                 val parsed = parseMagnetLink(magnetUri)
                 if (parsed == null) {
+                    val errPair = Pair(TorrentErrorType.INVALID_MAGNET, "Magnet bağlantısı çözümlenemedi. Lütfen geçerli bir 'magnet:?xt=urn:btih:...' linki girin.")
                     _downloadInfo.update {
                         it.copy(
                             state = TorrentState.ERROR,
-                            errorMessage = "Magnet bağlantısı çözümlenemedi. Lütfen geçerli bir 'magnet:?xt=urn:btih:...' linki girin."
+                            errorMessage = errPair.second,
+                            errorType = errPair.first
                         )
                     }
+                    logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errPair.second)
                     return@launch
                 }
 
@@ -97,6 +187,7 @@ object TorrentDownloadManager {
                         state = TorrentState.CONNECTING_TRACKERS
                     )
                 }
+                logTorrentSnapshot(stateOverride = TorrentState.CONNECTING_TRACKERS.name)
 
                 // 2. Discover peers from trackers
                 val allTrackers = (parsed.trackers + defaultTrackers).distinct()
@@ -126,8 +217,21 @@ object TorrentDownloadManager {
                     )
                 }
 
-                // 3. Setup temporary download file in app cache
+                // 3. Setup temporary download file in app cache & check permissions and space
                 val tempDir = File(context.cacheDir, "torrent_temp").apply { mkdirs() }
+                if (!tempDir.canWrite()) {
+                    val errPair = Pair(TorrentErrorType.PERMISSION, "Önbellek dizinine yazma izni reddedildi.")
+                    _downloadInfo.update { it.copy(state = TorrentState.ERROR, errorMessage = errPair.second, errorType = errPair.first) }
+                    logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errPair.second)
+                    return@launch
+                }
+                if (tempDir.usableSpace < 50L * 1024L * 1024L) {
+                    val errPair = Pair(TorrentErrorType.STORAGE_FULL, "Cihaz depolama alanı yetersiz (50MB'den az boş alan var).")
+                    _downloadInfo.update { it.copy(state = TorrentState.ERROR, errorMessage = errPair.second, errorType = errPair.first) }
+                    logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errPair.second)
+                    return@launch
+                }
+
                 val sanitizedName = TorrentStorageManager.sanitizeFileName(parsed.displayName)
                 val filename = if (TorrentStorageManager.isVideoFile(sanitizedName) || TorrentStorageManager.isTorrentFile(sanitizedName)) {
                     sanitizedName
@@ -149,18 +253,22 @@ object TorrentDownloadManager {
                         totalBytes = 250L * 1024L * 1024L // Estimated metadata size
                     )
                 }
+                logTorrentSnapshot(stateOverride = TorrentState.DOWNLOADING.name)
 
                 // 4. Download content via peer connections
                 executeDownloadLoop(context, outFile, uniquePeers, filename, null)
 
             } catch (t: Throwable) {
                 Log.e(TAG, "Torrent download error: ${t.localizedMessage}", t)
+                val (errType, errDesc) = classifyError(t)
                 _downloadInfo.update {
                     it.copy(
                         state = TorrentState.ERROR,
-                        errorMessage = "İndirme sırasında hata oluştu: ${t.localizedMessage}"
+                        errorMessage = errDesc,
+                        errorType = errType
                     )
                 }
+                logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errDesc)
             }
         }
     }
@@ -175,27 +283,34 @@ object TorrentDownloadManager {
                     state = TorrentState.RESOLVING_METADATA,
                     statusMessage = ".torrent dosyası okunuyor..."
                 )
+                logTorrentSnapshot(stateOverride = TorrentState.RESOLVING_METADATA.name)
 
                 val bytes = context.contentResolver.openInputStream(torrentUri)?.use { it.readBytes() }
                 if (bytes == null || bytes.isEmpty()) {
+                    val errPair = Pair(TorrentErrorType.INVALID_TORRENT, ".torrent dosyası açılamadı veya boş.")
                     _downloadInfo.update {
                         it.copy(
                             state = TorrentState.ERROR,
-                            errorMessage = ".torrent dosyası açılamadı veya boş."
+                            errorMessage = errPair.second,
+                            errorType = errPair.first
                         )
                     }
+                    logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errPair.second)
                     return@launch
                 }
 
                 val meta = try {
                     BencodeParser.parseTorrent(bytes)
                 } catch (e: Exception) {
+                    val errPair = Pair(TorrentErrorType.INVALID_TORRENT, "Geçersiz .torrent formatı: ${e.localizedMessage}")
                     _downloadInfo.update {
                         it.copy(
                             state = TorrentState.ERROR,
-                            errorMessage = "Geçersiz .torrent formatı: ${e.localizedMessage}"
+                            errorMessage = errPair.second,
+                            errorType = errPair.first
                         )
                     }
+                    logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errPair.second)
                     return@launch
                 }
 
@@ -209,6 +324,7 @@ object TorrentDownloadManager {
                         state = TorrentState.CONNECTING_TRACKERS
                     )
                 }
+                logTorrentSnapshot(stateOverride = TorrentState.CONNECTING_TRACKERS.name)
 
                 // Discover peers
                 val allTrackers = (meta.announceList + defaultTrackers).distinct()
@@ -237,8 +353,21 @@ object TorrentDownloadManager {
                     )
                 }
 
-                // Output file in app cache
+                // Output file in app cache & check permissions and space
                 val tempDir = File(context.cacheDir, "torrent_temp").apply { mkdirs() }
+                if (!tempDir.canWrite()) {
+                    val errPair = Pair(TorrentErrorType.PERMISSION, "Önbellek dizinine yazma izni reddedildi.")
+                    _downloadInfo.update { it.copy(state = TorrentState.ERROR, errorMessage = errPair.second, errorType = errPair.first) }
+                    logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errPair.second)
+                    return@launch
+                }
+                if (tempDir.usableSpace < 50L * 1024L * 1024L) {
+                    val errPair = Pair(TorrentErrorType.STORAGE_FULL, "Cihaz depolama alanı yetersiz (50MB'den az boş alan var).")
+                    _downloadInfo.update { it.copy(state = TorrentState.ERROR, errorMessage = errPair.second, errorType = errPair.first) }
+                    logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errPair.second)
+                    return@launch
+                }
+
                 val safeName = TorrentStorageManager.sanitizeFileName(meta.name)
                 val filename = if (TorrentStorageManager.isVideoFile(safeName)) {
                     safeName
@@ -260,17 +389,21 @@ object TorrentDownloadManager {
                         statusMessage = "İndiriliyor"
                     )
                 }
+                logTorrentSnapshot(stateOverride = TorrentState.DOWNLOADING.name)
 
                 executeDownloadLoop(context, outFile, uniquePeers, filename, bytes)
 
             } catch (t: Throwable) {
                 Log.e(TAG, "Torrent file download error: ${t.localizedMessage}", t)
+                val (errType, errDesc) = classifyError(t)
                 _downloadInfo.update {
                     it.copy(
                         state = TorrentState.ERROR,
-                        errorMessage = "Hata: ${t.localizedMessage}"
+                        errorMessage = errDesc,
+                        errorType = errType
                     )
                 }
+                logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errDesc)
             }
         }
     }
@@ -391,25 +524,40 @@ object TorrentDownloadManager {
                                 etaText = "00:00",
                                 downloadedFile = saveResult.permanentFile,
                                 permanentUri = saveResult.permanentUri,
-                                errorMessage = null
+                                errorMessage = null,
+                                errorType = null
                             )
                         }
+                        logTorrentSnapshot(stateOverride = TorrentState.COMPLETED.name)
                     }
                     is StorageSaveResult.Failure -> {
                         Log.e(TAG, "Kalıcı depolamaya aktarma hatası: ${saveResult.reason}")
+                        val (errType, errDesc) = classifyError(IllegalStateException(saveResult.reason))
                         _downloadInfo.update {
                             it.copy(
                                 state = TorrentState.ERROR,
-                                errorMessage = "Dosya cihaz depolamasına kaydedilemedi.",
+                                errorMessage = errDesc,
+                                errorType = errType,
                                 statusMessage = "Hata"
                             )
                         }
+                        logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errDesc)
                     }
                 }
             }
         } catch (e: Exception) {
             if (!isPaused) {
                 Log.w(TAG, "Download loop interrupted: ${e.localizedMessage}")
+                val (errType, errDesc) = classifyError(e)
+                _downloadInfo.update {
+                    it.copy(
+                        state = TorrentState.ERROR,
+                        errorMessage = errDesc,
+                        errorType = errType,
+                        statusMessage = "Hata"
+                    )
+                }
+                logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errDesc)
             }
         }
     }
@@ -516,6 +664,7 @@ object TorrentDownloadManager {
                                 etaText = etaText
                             )
                         }
+                        logTorrentSnapshot(stateOverride = TorrentState.DOWNLOADING.name)
                     }
                 }
             }

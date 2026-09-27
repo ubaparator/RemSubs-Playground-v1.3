@@ -369,6 +369,7 @@ fun AxiSubMainScreen(
                     onToggleFullscreen = viewModel::toggleFullscreen,
                     onPlayerError = viewModel::setErrorMessage,
                     onEditActiveCue = viewModel::startEditingCue,
+                    onVideoDimensionsDetected = viewModel::updateVideoDimensions,
                     modifier = if (uiState.isFullscreen) Modifier.weight(1f) else Modifier
                 )
 

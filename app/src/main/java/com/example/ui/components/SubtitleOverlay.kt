@@ -2,6 +2,7 @@ package com.example.ui.components
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
@@ -24,6 +25,7 @@ import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.model.SubtitleCue
@@ -40,14 +42,28 @@ fun SubtitleOverlay(
 ) {
     if (activeCues.isEmpty()) return
 
-    Box(
+    BoxWithConstraints(
         modifier = modifier.fillMaxSize()
     ) {
+        val containerHeight = maxHeight
+        // 216dp is the reference preview height (16:9 on ~384dp wide standard mobile screen).
+        // This guarantees mathematical 1:1 proportionality with ASS PlayResY and hardsub video.
+        val scale = (containerHeight.value / 216f).coerceIn(0.5f, 4.0f)
+
+        val scaledFontSize = (style.fontSizeSp * scale).sp
+        val scaledVerticalOffset = (style.verticalOffsetDp * scale).dp
+        val scaledHorizontalPadding = (style.horizontalPaddingDp * scale).dp
+        val scaledOutlineWidth = (style.outlineWidth * scale).coerceAtLeast(1f)
+
         activeCues.forEach { cue ->
-            val vAlign = if (cue.customPositionEnabled) cue.customVerticalAlign else style.verticalAlign
-            val hAlign = if (cue.customPositionEnabled) cue.customHorizontalAlign else style.horizontalAlign
-            val vOffset = if (cue.customPositionEnabled) cue.customVerticalOffsetDp.dp else style.verticalOffset
-            val hOffset = if (cue.customPositionEnabled) cue.customHorizontalOffsetDp.dp else 0.dp
+            val overrideAlign = extractAssAlignmentFromText(cue.rawText)
+            val vAlign = if (cue.customPositionEnabled) cue.customVerticalAlign
+                else (overrideAlign?.first ?: style.verticalAlign)
+            val hAlign = if (cue.customPositionEnabled) cue.customHorizontalAlign
+                else (overrideAlign?.second ?: style.horizontalAlign)
+
+            val vOffset = if (cue.customPositionEnabled) (cue.customVerticalOffsetDp * scale).dp else scaledVerticalOffset
+            val hOffset = if (cue.customPositionEnabled) (cue.customHorizontalOffsetDp * scale).dp else 0.dp
 
             val alignment = when (vAlign) {
                 SubtitleVerticalAlign.TOP -> when (hAlign) {
@@ -70,16 +86,16 @@ fun SubtitleOverlay(
             val paddingModifier = when (vAlign) {
                 SubtitleVerticalAlign.TOP -> Modifier.padding(
                     top = vOffset,
-                    start = style.horizontalPadding,
-                    end = style.horizontalPadding
+                    start = scaledHorizontalPadding,
+                    end = scaledHorizontalPadding
                 )
                 SubtitleVerticalAlign.MIDDLE -> Modifier.padding(
-                    horizontal = style.horizontalPadding
+                    horizontal = scaledHorizontalPadding
                 )
                 SubtitleVerticalAlign.BOTTOM -> Modifier.padding(
                     bottom = vOffset,
-                    start = style.horizontalPadding,
-                    end = style.horizontalPadding
+                    start = scaledHorizontalPadding,
+                    end = scaledHorizontalPadding
                 )
             }
 
@@ -89,9 +105,14 @@ fun SubtitleOverlay(
                 Modifier
             }
 
+            val cueFontSize = if (cue.customPositionEnabled && cue.customFontSizeSp != null) {
+                (cue.customFontSizeSp * scale).sp
+            } else {
+                scaledFontSize
+            }
+
             val cueStyle = if (cue.customPositionEnabled) {
                 style.copy(
-                    fontSizeSp = cue.customFontSizeSp ?: style.fontSizeSp,
                     textColor = cue.customTextColorArgb?.let { Color(it) } ?: style.textColor,
                     outlineColor = cue.customOutlineColorArgb?.let { Color(it) } ?: style.outlineColor,
                     hasOutline = if (cue.customOutlineColorArgb != null) true else style.hasOutline,
@@ -115,7 +136,10 @@ fun SubtitleOverlay(
                 SingleSubtitleView(
                     cue = cue,
                     style = cueStyle,
-                    fontFamily = fontFamily
+                    effectiveFontSize = cueFontSize,
+                    effectiveOutlineWidth = scaledOutlineWidth,
+                    fontFamily = fontFamily,
+                    previewScale = scale
                 )
             }
         }
@@ -126,18 +150,21 @@ fun SubtitleOverlay(
 private fun SingleSubtitleView(
     cue: SubtitleCue,
     style: SubtitleStyle,
-    fontFamily: FontFamily?
+    effectiveFontSize: TextUnit,
+    effectiveOutlineWidth: Float,
+    fontFamily: FontFamily?,
+    previewScale: Float
 ) {
     val boxModifier = if (style.hasBackgroundBox) {
         Modifier
             .background(style.backgroundColor, RoundedCornerShape(8.dp))
-            .padding(horizontal = 10.dp, vertical = 4.dp)
+            .padding(horizontal = (10 * previewScale).dp, vertical = (4 * previewScale).dp)
     } else {
         Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
     }
 
-    val annotatedText = remember(cue.rawText, cue.cleanText, style.isItalic, style.isBold, style.isUnderline) {
-        buildAnnotatedSubtitle(cue.rawText, cue.cleanText, style)
+    val annotatedText = remember(cue.rawText, cue.cleanText, style.isItalic, style.isBold, style.isUnderline, previewScale) {
+        buildAnnotatedSubtitle(cue.rawText, cue.cleanText, style, previewScale)
     }
 
     Box(
@@ -145,16 +172,16 @@ private fun SingleSubtitleView(
         contentAlignment = Alignment.Center
     ) {
         // Outline layer if enabled
-        if (style.hasOutline && style.outlineWidth > 0) {
+        if (style.hasOutline && effectiveOutlineWidth > 0) {
             Text(
                 text = annotatedText,
                 textAlign = style.textAlign,
-                fontSize = style.fontSize,
+                fontSize = effectiveFontSize,
                 fontFamily = fontFamily,
                 style = TextStyle(
                     color = style.outlineColor,
                     drawStyle = Stroke(
-                        width = style.outlineWidth * 2.5f
+                        width = effectiveOutlineWidth * 2.5f
                     )
                 )
             )
@@ -165,12 +192,12 @@ private fun SingleSubtitleView(
             text = annotatedText,
             color = style.textColor,
             textAlign = style.textAlign,
-            fontSize = style.fontSize,
+            fontSize = effectiveFontSize,
             fontFamily = fontFamily,
             style = TextStyle(
                 shadow = if (style.hasOutline) null else Shadow(
                     color = Color.Black,
-                    blurRadius = 4f
+                    blurRadius = 4f * previewScale
                 )
             )
         )
@@ -178,13 +205,58 @@ private fun SingleSubtitleView(
 }
 
 /**
- * Parses ASS tags ({\i1}, {\b1}, {\u1}, \N, etc.) and HTML tags (<i>, <b>, <u>)
- * to build an AnnotatedString preserving styling, bold, italic, and underline.
+ * Extracts ASS alignment tag \an1 to \an9 from dialogue text:
+ * 7: TopLeft, 8: TopCenter, 9: TopRight
+ * 4: MidLeft, 5: MidCenter, 6: MidRight
+ * 1: BotLeft, 2: BotCenter, 3: BotRight
+ */
+fun extractAssAlignmentFromText(text: String): Pair<SubtitleVerticalAlign, SubtitleHorizontalAlign>? {
+    if (!text.contains("\\an")) return null
+    val match = Regex("""\\an([1-9])""").find(text) ?: return null
+    val num = match.groupValues[1].toIntOrNull() ?: return null
+    return when (num) {
+        7 -> Pair(SubtitleVerticalAlign.TOP, SubtitleHorizontalAlign.LEFT)
+        8 -> Pair(SubtitleVerticalAlign.TOP, SubtitleHorizontalAlign.CENTER)
+        9 -> Pair(SubtitleVerticalAlign.TOP, SubtitleHorizontalAlign.RIGHT)
+        4 -> Pair(SubtitleVerticalAlign.MIDDLE, SubtitleHorizontalAlign.LEFT)
+        5 -> Pair(SubtitleVerticalAlign.MIDDLE, SubtitleHorizontalAlign.CENTER)
+        6 -> Pair(SubtitleVerticalAlign.MIDDLE, SubtitleHorizontalAlign.RIGHT)
+        1 -> Pair(SubtitleVerticalAlign.BOTTOM, SubtitleHorizontalAlign.LEFT)
+        3 -> Pair(SubtitleVerticalAlign.BOTTOM, SubtitleHorizontalAlign.RIGHT)
+        else -> Pair(SubtitleVerticalAlign.BOTTOM, SubtitleHorizontalAlign.CENTER)
+    }
+}
+
+/**
+ * Parses ASS hex color override like \c&HBBGGRR& or \1c&HBBGGRR&
+ */
+fun parseAssInlineColor(token: String): Color? {
+    val clean = token.replace("{", "").replace("}", "")
+        .replace("&", "")
+        .replace("\\1c", "")
+        .replace("\\c", "")
+        .trim()
+    val hex = clean.removePrefix("H").removePrefix("h")
+    if (hex.length >= 6) {
+        return try {
+            val b = hex.substring(0, 2).toInt(16)
+            val g = hex.substring(2, 4).toInt(16)
+            val r = hex.substring(4, 6).toInt(16)
+            Color(r, g, b)
+        } catch (_: Exception) { null }
+    }
+    return null
+}
+
+/**
+ * Parses ASS tags ({\i1}, {\b1}, {\u1}, {\c...}, {\fs...}, \N, etc.) and HTML tags (<i>, <b>, <u>)
+ * to build an AnnotatedString preserving styling, bold, italic, underline, inline colors, and font sizes.
  */
 fun buildAnnotatedSubtitle(
     rawText: String,
     cleanText: String,
-    style: SubtitleStyle
+    style: SubtitleStyle,
+    previewScale: Float = 1.0f
 ): AnnotatedString {
     val sourceText = if (rawText.isNotBlank() && (rawText.contains("{") || rawText.contains("<") || rawText.contains("\\N"))) {
         rawText
@@ -215,19 +287,25 @@ fun buildAnnotatedSubtitle(
         var activeBold = style.isBold
         var activeItalic = style.isItalic
         var activeUnderline = style.isUnderline
+        var activeColor: Color? = null
+        var activeFontSize: TextUnit? = null
+
+        fun currentSpanStyle(): SpanStyle {
+            return SpanStyle(
+                color = activeColor ?: Color.Unspecified,
+                fontSize = activeFontSize ?: TextUnit.Unspecified,
+                fontWeight = if (activeBold) FontWeight.Bold else FontWeight.Normal,
+                fontStyle = if (activeItalic) FontStyle.Italic else FontStyle.Normal,
+                textDecoration = if (activeUnderline) TextDecoration.Underline else TextDecoration.None
+            )
+        }
 
         for (match in matches) {
             val matchRange = match.range
             if (matchRange.first > currentIndex) {
                 val plainPart = sourceText.substring(currentIndex, matchRange.first)
                 if (plainPart.isNotEmpty()) {
-                    withStyle(
-                        SpanStyle(
-                            fontWeight = if (activeBold) FontWeight.Bold else FontWeight.Normal,
-                            fontStyle = if (activeItalic) FontStyle.Italic else FontStyle.Normal,
-                            textDecoration = if (activeUnderline) TextDecoration.Underline else TextDecoration.None
-                        )
-                    ) {
+                    withStyle(currentSpanStyle()) {
                         append(plainPart)
                     }
                 }
@@ -249,6 +327,25 @@ fun buildAnnotatedSubtitle(
                     if (inner.contains("\\b0")) activeBold = false
                     if (inner.contains("\\u1")) activeUnderline = true
                     if (inner.contains("\\u0")) activeUnderline = false
+
+                    // Inline text color \c&HBBGGRR& or \1c&HBBGGRR&
+                    if (inner.contains("\\c") || inner.contains("\\1c")) {
+                        val colMatch = Regex("""\\(?:1c|c)(&?H?[0-9a-fA-F]{6}&?)""").find(inner)
+                        if (colMatch != null) {
+                            activeColor = parseAssInlineColor(colMatch.value)
+                        }
+                    }
+
+                    // Inline font size \fsXX
+                    if (inner.contains("\\fs")) {
+                        val fsMatch = Regex("""\\fs([0-9]+)""").find(inner)
+                        val rawFs = fsMatch?.groupValues?.get(1)?.toFloatOrNull()
+                        if (rawFs != null) {
+                            // Scale font size according to preview scale
+                            val fsInPreview = (rawFs / (1080f / 216f)) * previewScale
+                            activeFontSize = fsInPreview.sp
+                        }
+                    }
                 }
                 token.startsWith("<") && token.endsWith(">") -> {
                     val lower = token.lowercase()
@@ -270,13 +367,7 @@ fun buildAnnotatedSubtitle(
         if (currentIndex < sourceText.length) {
             val tail = sourceText.substring(currentIndex)
             if (tail.isNotEmpty()) {
-                withStyle(
-                    SpanStyle(
-                        fontWeight = if (activeBold) FontWeight.Bold else FontWeight.Normal,
-                        fontStyle = if (activeItalic) FontStyle.Italic else FontStyle.Normal,
-                        textDecoration = if (activeUnderline) TextDecoration.Underline else TextDecoration.None
-                    )
-                ) {
+                withStyle(currentSpanStyle()) {
                     append(tail)
                 }
             }
