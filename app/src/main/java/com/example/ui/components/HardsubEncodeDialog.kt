@@ -2,7 +2,10 @@ package com.example.ui.components
 
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.BorderStroke
@@ -57,6 +60,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -71,9 +75,13 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.FileProvider
+import androidx.media3.common.MediaItem
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.PlayerView
 import com.example.encode.EncodeState
 import com.example.encode.EncoderOption
 import com.example.encode.EncodingSettings
@@ -93,7 +101,11 @@ fun HardsubEncodeDialog(
     onPlayEncodedVideo: (File) -> Unit,
     onSaveToDevice: (File) -> Unit,
     onUpdateSettings: (EncodingSettings) -> Unit = {},
-    onOpenCompatibilityTest: () -> Unit = {}
+    onOpenCompatibilityTest: () -> Unit = {},
+    onSelectIntroVideo: (Uri) -> Unit = {},
+    onRemoveIntroVideo: () -> Unit = {},
+    onSetIntroKeepAudio: (Boolean) -> Unit = {},
+    onToggleIntroPreview: (Boolean) -> Unit = {}
 ) {
     val context = LocalContext.current
     var showLogs by remember { mutableStateOf(false) }
@@ -218,7 +230,11 @@ fun HardsubEncodeDialog(
                             onUpdateSettings = onUpdateSettings,
                             onOpenCompatibilityTest = onOpenCompatibilityTest,
                             onStartEncode = onStartEncode,
-                            onClose = onDismiss
+                            onClose = onDismiss,
+                            onSelectIntroVideo = onSelectIntroVideo,
+                            onRemoveIntroVideo = onRemoveIntroVideo,
+                            onSetIntroKeepAudio = onSetIntroKeepAudio,
+                            onToggleIntroPreview = onToggleIntroPreview
                         )
                     }
                 }
@@ -235,9 +251,20 @@ private fun ReadyToEncodeContent(
     onUpdateSettings: (EncodingSettings) -> Unit,
     onOpenCompatibilityTest: () -> Unit,
     onStartEncode: () -> Unit,
-    onClose: () -> Unit
+    onClose: () -> Unit,
+    onSelectIntroVideo: (Uri) -> Unit = {},
+    onRemoveIntroVideo: () -> Unit = {},
+    onSetIntroKeepAudio: (Boolean) -> Unit = {},
+    onToggleIntroPreview: (Boolean) -> Unit = {}
 ) {
     var showAdvancedSettings by remember { mutableStateOf(false) }
+    val introPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            onSelectIntroVideo(uri)
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -292,7 +319,165 @@ private fun ReadyToEncodeContent(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // 2. Encoder ve Kalite Seçimi
+        // 2. İntro Videosu Card (İsteğe Bağlı - Requirement 11 & 13)
+        Card(
+            shape = RoundedCornerShape(12.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = if (uiState.introVideoUri != null)
+                    MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.25f)
+                else
+                    MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
+            ),
+            border = BorderStroke(
+                1.dp,
+                if (uiState.introVideoUri != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("card_intro_section")
+        ) {
+            Column(modifier = Modifier.padding(14.dp)) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.Movie,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "İntro Videosu",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                    if (uiState.introVideoUri == null) {
+                        OutlinedButton(
+                            onClick = { introPickerLauncher.launch("video/*") },
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.testTag("btn_add_intro")
+                        ) {
+                            Text("Intro Ekle", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+
+                if (uiState.introVideoUri != null) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    InfoRow(label = "Adı:", value = uiState.introVideoTitle ?: "İntro")
+                    InfoRow(
+                        label = "Süresi:",
+                        value = String.format(Locale.US, "%.1f sn", uiState.introVideoDurationMs / 1000f)
+                    )
+                    InfoRow(
+                        label = "Çözünürlük:",
+                        value = if (uiState.introVideoWidth > 0 && uiState.introVideoHeight > 0)
+                            "${uiState.introVideoWidth}x${uiState.introVideoHeight}"
+                        else "Otomatik"
+                    )
+                    InfoRow(
+                        label = "FPS:",
+                        value = String.format(Locale.US, "%.1f", uiState.introVideoFps)
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    // Intro Audio Selection (Keep vs Mute - Requirement 13)
+                    Text(
+                        text = "İntro Sesi:",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        FilterChip(
+                            selected = !uiState.introKeepAudio,
+                            onClick = { onSetIntroKeepAudio(false) },
+                            label = { Text("Sesi Kapat (Mute)", fontSize = 11.sp) },
+                            modifier = Modifier.testTag("chip_intro_audio_mute")
+                        )
+                        FilterChip(
+                            selected = uiState.introKeepAudio,
+                            onClick = { onSetIntroKeepAudio(true) },
+                            label = { Text("Sesi Koru (Keep)", fontSize = 11.sp) },
+                            modifier = Modifier.testTag("chip_intro_audio_keep")
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    // Action buttons: Intro Önizle, Değiştir, Kaldır
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        OutlinedButton(
+                            onClick = { onToggleIntroPreview(!uiState.showIntroPreview) },
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("btn_preview_intro")
+                        ) {
+                            Text(if (uiState.showIntroPreview) "Önizlemeyi Kapat" else "Intro Önizle", fontSize = 11.sp)
+                        }
+                        OutlinedButton(
+                            onClick = { introPickerLauncher.launch("video/*") },
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("btn_change_intro")
+                        ) {
+                            Text("Değiştir", fontSize = 11.sp)
+                        }
+                        Button(
+                            onClick = onRemoveIntroVideo,
+                            shape = RoundedCornerShape(8.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.errorContainer,
+                                contentColor = MaterialTheme.colorScheme.onErrorContainer
+                            ),
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("btn_remove_intro")
+                        ) {
+                            Text("Kaldır", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+
+                    if (uiState.showIntroPreview && uiState.introVideoUri != null) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        IntroPreviewPlayer(
+                            videoUri = uiState.introVideoUri,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(160.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                        )
+                    }
+                } else {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Videonun başına intro eklenmedi. Encode doğrudan ana video ile başlar.",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.outline
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // 3. Encoder ve Kalite Seçimi
         Card(
             shape = RoundedCornerShape(12.dp),
             colors = CardDefaults.cardColors(
@@ -1187,4 +1372,35 @@ private fun shareVideoFile(context: Context, file: File) {
     } catch (e: Exception) {
         Toast.makeText(context, "Paylaşım hatası: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
     }
+}
+
+@Composable
+fun IntroPreviewPlayer(
+    videoUri: Uri,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val exoPlayer = remember(videoUri) {
+        ExoPlayer.Builder(context).build().apply {
+            setMediaItem(MediaItem.fromUri(videoUri))
+            prepare()
+            playWhenReady = true
+        }
+    }
+
+    DisposableEffect(exoPlayer) {
+        onDispose {
+            exoPlayer.release()
+        }
+    }
+
+    AndroidView(
+        factory = { ctx ->
+            PlayerView(ctx).apply {
+                player = exoPlayer
+                useController = true
+            }
+        },
+        modifier = modifier
+    )
 }

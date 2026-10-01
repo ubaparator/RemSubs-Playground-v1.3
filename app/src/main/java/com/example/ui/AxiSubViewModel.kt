@@ -69,7 +69,15 @@ data class AxiSubUiState(
     val selectedMkvTrack: com.example.mkv.MkvSubtitleTrack? = null,
     val extractedSubtitleFile: File? = null,
     val mkvExtractionErrorMessage: String? = null,
-    val isHardsubVideoPlaying: Boolean = false
+    val isHardsubVideoPlaying: Boolean = false,
+    val introVideoUri: Uri? = null,
+    val introVideoTitle: String? = null,
+    val introVideoDurationMs: Long = 0L,
+    val introVideoWidth: Int = 0,
+    val introVideoHeight: Int = 0,
+    val introVideoFps: Double = 30.0,
+    val introKeepAudio: Boolean = false,
+    val showIntroPreview: Boolean = false
 )
 
 class AxiSubViewModel(application: Application) : AndroidViewModel(application) {
@@ -554,6 +562,10 @@ class AxiSubViewModel(application: Application) : AndroidViewModel(application) 
         com.example.torrent.TorrentDownloadManager.cancelDownload()
     }
 
+    fun selectTorrentVideoFile(fileName: String) {
+        com.example.torrent.TorrentDownloadManager.selectVideoFile(fileName)
+    }
+
     fun openDownloadedVideoInEditor(file: File) {
         val permanentUri = com.example.torrent.TorrentDownloadManager.downloadInfo.value.permanentUri
         val uri = permanentUri ?: Uri.fromFile(file)
@@ -597,7 +609,10 @@ class AxiSubViewModel(application: Application) : AndroidViewModel(application) 
                     customFontFile = customFontFile,
                     additionalStyles = additionalStyles,
                     settings = state.encodingSettings,
-                    sourceMetadata = state.sourceVideoMetadata
+                    sourceMetadata = state.sourceVideoMetadata,
+                    introVideoUri = state.introVideoUri,
+                    introDurationMs = state.introVideoDurationMs,
+                    introKeepAudio = state.introKeepAudio
                 )
             } catch (t: Throwable) {
                 android.util.Log.e("AxiSubViewModel", "Fatal error in startHardsubEncode", t)
@@ -606,6 +621,62 @@ class AxiSubViewModel(application: Application) : AndroidViewModel(application) 
                 }
             }
         }
+    }
+
+    fun setIntroVideo(uri: Uri) {
+        val context = getApplication<Application>()
+        val title = FontManager.getFileName(context, uri) ?: "İntro Video"
+        val retriever = android.media.MediaMetadataRetriever()
+        var dur = 0L
+        var w = 0
+        var h = 0
+        var fps = 30.0
+        try {
+            retriever.setDataSource(context, uri)
+            dur = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+            w = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
+            h = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
+            val fpsStr = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
+            } else null
+            fps = fpsStr?.toDoubleOrNull() ?: 30.0
+        } catch (_: Exception) {}
+        finally {
+            try { retriever.release() } catch (_: Exception) {}
+        }
+        _uiState.update {
+            it.copy(
+                introVideoUri = uri,
+                introVideoTitle = title,
+                introVideoDurationMs = dur,
+                introVideoWidth = w,
+                introVideoHeight = h,
+                introVideoFps = fps,
+                statusMessage = "İntro video eklendi: $title (${String.format(java.util.Locale.US, "%.1f sn", dur / 1000f)})"
+            )
+        }
+    }
+
+    fun removeIntroVideo() {
+        _uiState.update {
+            it.copy(
+                introVideoUri = null,
+                introVideoTitle = null,
+                introVideoDurationMs = 0L,
+                introVideoWidth = 0,
+                introVideoHeight = 0,
+                showIntroPreview = false,
+                statusMessage = "İntro video kaldırıldı."
+            )
+        }
+    }
+
+    fun setIntroKeepAudio(keep: Boolean) {
+        _uiState.update { it.copy(introKeepAudio = keep) }
+    }
+
+    fun setShowIntroPreview(show: Boolean) {
+        _uiState.update { it.copy(showIntroPreview = show) }
     }
 
     fun inspectMkvForSoftsubs(uri: Uri) {

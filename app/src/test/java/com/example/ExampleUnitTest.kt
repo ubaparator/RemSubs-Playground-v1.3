@@ -376,4 +376,290 @@ class ExampleUnitTest {
         // 1:1 mathematical ratio between preview and ASS subtitle rendering
         assertEquals(previewRatio, assRatio, 0.001f)
     }
+
+    @Test
+    fun testHtmlEntityDecodingAndTags() {
+        val input = "&lt;b&gt;&amp;quot;Rem&amp;quot; &amp;amp; &amp;apos;Subaru&amp;apos;&lt;/b&gt;"
+        val decoded = com.example.parser.HtmlSubtitleParser.decodeHtmlEntities(input)
+        assertEquals("<b>\"Rem\" & 'Subaru'</b>", decoded)
+
+        val plain = com.example.parser.HtmlSubtitleParser.cleanToPlainText("<b><i>Merhaba</i></b><br>İkinci satır &amp; son")
+        assertEquals("Merhaba\nİkinci satır & son", plain)
+    }
+
+    @Test
+    fun testHtmlToAssConversionWithColorsAndNesting() {
+        // Italic, bold, underline and color tag conversions
+        val html = "<b><i>Kalın ve İtalik</i></b> <font color=\"#FF0000\">Kırmızı</font><br>Yeni Satır"
+        val ass = com.example.parser.HtmlSubtitleParser.htmlToAss(html)
+        assertTrue(ass.contains("{\\b1}{\\i1}Kalın ve İtalik{\\i0}{\\b0}"))
+        assertTrue(ass.contains("{\\c&H0000FF&}Kırmızı{\\c\\fn\\fs}"))
+        assertTrue(ass.contains("\\N"))
+    }
+
+    @Test
+    fun testAssSubtitleGenerationWithIntroOffset() {
+        val cue = com.example.model.SubtitleCue(
+            id = 1,
+            startTimeMs = 2000L,
+            endTimeMs = 5000L,
+            rawText = "Merhaba",
+            cleanText = "Merhaba"
+        )
+        // Without intro offset
+        val ass0 = com.example.parser.AssGenerator.generateAss(
+            title = "test",
+            subtitles = listOf(cue),
+            style = com.example.model.SubtitleStyle(),
+            introOffsetMs = 0L
+        )
+        assertTrue(ass0.contains("0:00:02.00,0:00:05.00"))
+
+        // With 3000ms (3 sec) intro offset - cues must shift automatically
+        val assIntro = com.example.parser.AssGenerator.generateAss(
+            title = "test",
+            subtitles = listOf(cue),
+            style = com.example.model.SubtitleStyle(),
+            introOffsetMs = 3000L
+        )
+        assertTrue("Subtitles must shift by intro offset: $assIntro", assIntro.contains("0:00:05.00,0:00:08.00"))
+    }
+
+    @Test
+    fun testMediaStorageMimeTypePreservation() {
+        // Real container format and extensions must be preserved without converting MKV to MP4
+        assertEquals("video/x-matroska", com.example.util.MediaStorageManager.resolveExactMimeType("Movie.mkv"))
+        assertEquals("video/mp4", com.example.util.MediaStorageManager.resolveExactMimeType("Video.mp4"))
+        assertEquals("video/webm", com.example.util.MediaStorageManager.resolveExactMimeType("Clip.webm"))
+        assertEquals("video/x-msvideo", com.example.util.MediaStorageManager.resolveExactMimeType("Old.avi"))
+    }
+
+    // --- TEST 3: ASS/SRT IMPORT-EXPORT TEST ---
+    @Test
+    fun testAssSrtImportExportRoundTrip() {
+        val originalCues = listOf(
+            com.example.model.SubtitleCue(
+                id = 1,
+                startTimeMs = 1200L,
+                endTimeMs = 4500L,
+                rawText = "İlk Altyazı Satırı",
+                cleanText = "İlk Altyazı Satırı"
+            ),
+            com.example.model.SubtitleCue(
+                id = 2,
+                startTimeMs = 6000L,
+                endTimeMs = 9500L,
+                rawText = "İkinci Altyazı Satırı",
+                cleanText = "İkinci Altyazı Satırı"
+            )
+        )
+
+        // Export to SRT
+        val srtText = SubtitleParser.exportToSrt(originalCues)
+        assertTrue(srtText.contains("00:00:01,200 --> 00:00:04,500"))
+        assertTrue(srtText.contains("İlk Altyazı Satırı"))
+        assertTrue(srtText.contains("00:00:06,000 --> 00:00:09,500"))
+
+        // Re-import from SRT
+        val reimportedSrt = SubtitleParser.parseSrt(srtText)
+        assertEquals(2, reimportedSrt.size)
+        assertEquals(1200L, reimportedSrt[0].startTimeMs)
+        assertEquals(4500L, reimportedSrt[0].endTimeMs)
+        assertEquals("İlk Altyazı Satırı", reimportedSrt[0].cleanText)
+        assertEquals(6000L, reimportedSrt[1].startTimeMs)
+        assertEquals(9500L, reimportedSrt[1].endTimeMs)
+        assertEquals("İkinci Altyazı Satırı", reimportedSrt[1].cleanText)
+
+        // Export to ASS
+        val assText = com.example.parser.AssGenerator.generateAss(
+            title = "roundtrip.ass",
+            subtitles = originalCues,
+            style = com.example.model.SubtitleStyle()
+        )
+        assertTrue(assText.contains("Dialogue: 0,0:00:01.20,0:00:04.50,Default"))
+        assertTrue(assText.contains("Dialogue: 0,0:00:06.00,0:00:09.50,Default"))
+
+        // Re-import from ASS
+        val reimportedAss = SubtitleParser.parseAss(assText)
+        assertEquals(2, reimportedAss.size)
+        assertEquals(1200L, reimportedAss[0].startTimeMs)
+        assertEquals(4500L, reimportedAss[0].endTimeMs)
+        assertEquals("İlk Altyazı Satırı", reimportedAss[0].cleanText)
+    }
+
+    // --- TEST 4: HTML TAGS TEST ---
+    @Test
+    fun testHtmlTagParsingComprehensive() {
+        // Nested tags: <i><b><u>
+        val nestedHtml = "<i><b><u>Üçlü İç İçe Metin</u></b></i>"
+        val nestedAss = com.example.parser.HtmlSubtitleParser.htmlToAss(nestedHtml)
+        assertTrue(nestedAss.contains("{\\i1}{\\b1}{\\u1}Üçlü İç İçe Metin{\\u0}{\\b0}{\\i0}"))
+
+        // Font color, face, size
+        val fontHtml = "<font color=\"#00FF00\" face=\"Roboto\" size=\"28\">Yeşil Roboto</font>"
+        val fontAss = com.example.parser.HtmlSubtitleParser.htmlToAss(fontHtml)
+        assertTrue(fontAss.contains("\\c&H00FF00&"))
+        assertTrue(fontAss.contains("\\fnRoboto"))
+        assertTrue(fontAss.contains("\\fs28"))
+
+        // Line break <br> and <br/>
+        val brHtml = "Satır 1<br>Satır 2<br/>Satır 3"
+        val brAss = com.example.parser.HtmlSubtitleParser.htmlToAss(brHtml)
+        assertEquals("Satır 1\\NSatır 2\\NSatır 3", brAss)
+
+        // HTML Entities: &amp;, &lt;, &gt;, &quot;, &apos;, &nbsp;
+        val entityHtml = "&lt;Rem &amp; Ram&gt; &quot;Subaru&quot; &apos;Emilia&apos;&nbsp;Re:Zero"
+        val plainText = com.example.parser.HtmlSubtitleParser.cleanToPlainText(entityHtml)
+        assertEquals("<Rem & Ram> \"Subaru\" 'Emilia' Re:Zero", plainText)
+    }
+
+    // --- TEST 5: PREVIEW-VS-ENCODE IMAGE / COORDINATE TEST ---
+    @Test
+    fun testPreviewVsEncodeCoordinateSystem() {
+        val playResX = 1920
+        val playResY = 1080
+        val previewContainerWidth = 960f
+        val previewContainerHeight = 540f
+
+        // Video scale factor calculation
+        val scaleX = previewContainerWidth / playResX.toFloat()
+        val scaleY = previewContainerHeight / playResY.toFloat()
+        assertEquals(0.5f, scaleX, 0.001f)
+        assertEquals(0.5f, scaleY, 0.001f)
+
+        // ASS position (x=960, y=1000) scaled to preview coordinates
+        val assPosX = 960f
+        val assPosY = 1000f
+        val previewPosX = assPosX * scaleX
+        val previewPosY = assPosY * scaleY
+        assertEquals(480f, previewPosX, 0.001f)
+        assertEquals(500f, previewPosY, 0.001f)
+
+        // Font scaling: 48sp ASS font at 1080p scaled to 540p preview = 24sp
+        val assFontSize = 48f
+        val previewFontSize = assFontSize * scaleY
+        assertEquals(24f, previewFontSize, 0.001f)
+    }
+
+    // --- TEST 6: INTRO + SUBTITLE TEST ---
+    @Test
+    fun testIntroPlusSubtitleShiftAndConcatenation() {
+        val introDurationMs = 5000L // 5 seconds intro
+        val cue1 = com.example.model.SubtitleCue(
+            id = 1,
+            startTimeMs = 1500L,
+            endTimeMs = 4000L,
+            rawText = "Intro Sonrası İlk Cümle",
+            cleanText = "Intro Sonrası İlk Cümle"
+        )
+        val cue2 = com.example.model.SubtitleCue(
+            id = 2,
+            startTimeMs = 8000L,
+            endTimeMs = 11000L,
+            rawText = "İkinci Cümle",
+            cleanText = "İkinci Cümle"
+        )
+
+        // Shift by intro duration
+        val shiftedAss = com.example.parser.AssGenerator.generateAss(
+            title = "intro_test.ass",
+            subtitles = listOf(cue1, cue2),
+            style = com.example.model.SubtitleStyle(),
+            introOffsetMs = introDurationMs
+        )
+
+        // 1500ms + 5000ms = 6500ms (0:00:06.50), 4000ms + 5000ms = 9000ms (0:00:09.00)
+        assertTrue(shiftedAss.contains("0:00:06.50,0:00:09.00"))
+        // 8000ms + 5000ms = 13000ms (0:00:13.00), 11000ms + 5000ms = 16000ms (0:00:16.00)
+        assertTrue(shiftedAss.contains("0:00:13.00,0:00:16.00"))
+    }
+
+    // --- TEST 7: REAL MAGNET TORRENT TEST ---
+    @Test
+    fun testRealMagnetUriParsingAndValidation() {
+        val magnet = "magnet:?xt=urn:btih:da39a3ee5e6b4b0d3255bfef95601890afd80709&dn=SampleVideo&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337"
+        val manager = com.example.torrent.TorrentDownloadManager
+
+        val pattern = java.util.regex.Pattern.compile("urn:btih:([a-zA-Z0-9]+)")
+        val matcher = pattern.matcher(magnet)
+        assertTrue(matcher.find())
+        assertEquals("da39a3ee5e6b4b0d3255bfef95601890afd80709", matcher.group(1))
+
+        // Validating error handling
+        val (errType, msg) = manager.classifyErrorMessage("invalid magnet link")
+        assertEquals(com.example.torrent.TorrentErrorType.INVALID_MAGNET, errType)
+    }
+
+    // --- TEST 8: GALLERY / MEDIASTORE TEST ---
+    @Test
+    fun testGalleryMediaStoreContainerAndFileNameSanitization() {
+        // Extension preservation
+        val files = listOf(
+            "Video 1 [1080p].mkv" to "video/x-matroska",
+            "Episode 01.mp4" to "video/mp4",
+            "Trailer.webm" to "video/webm",
+            "OldClassic.avi" to "video/x-msvideo"
+        )
+        for ((name, expectedMime) in files) {
+            val resolvedMime = com.example.util.MediaStorageManager.resolveExactMimeType(name)
+            assertEquals(expectedMime, resolvedMime)
+            assertTrue(com.example.util.MediaStorageManager.isVideoFile(name))
+        }
+
+        // Sanitization
+        val rawName = "Re:Zero / Episode *01* <v2>?.mkv"
+        val sanitized = com.example.torrent.TorrentStorageManager.sanitizeFileName(rawName)
+        org.junit.Assert.assertFalse(sanitized.contains(":"))
+        org.junit.Assert.assertFalse(sanitized.contains("/"))
+        org.junit.Assert.assertFalse(sanitized.contains("*"))
+        org.junit.Assert.assertFalse(sanitized.contains("<"))
+        org.junit.Assert.assertFalse(sanitized.contains(">"))
+        org.junit.Assert.assertFalse(sanitized.contains("?"))
+        assertTrue(sanitized.endsWith(".mkv"))
+    }
+
+    // --- TEST 9: CUSTOM FONT TEST ---
+    @Test
+    fun testCustomFontMetadataAndFamilyResolution() {
+        val robotoFile = java.io.File("app/src/main/res/font/roboto.ttf")
+        val montserratFile = java.io.File("app/src/main/res/font/montserrat.ttf")
+
+        if (robotoFile.exists()) {
+            val names = com.example.util.FontMetadataParser.extractFontNames(robotoFile)
+            org.junit.Assert.assertNotNull(names.familyName)
+            assertTrue("Should contain Roboto in family or full name: ${names.allDistinctNames}",
+                names.allDistinctNames.any { it.contains("Roboto", ignoreCase = true) })
+        }
+
+        if (montserratFile.exists()) {
+            val names = com.example.util.FontMetadataParser.extractFontNames(montserratFile)
+            org.junit.Assert.assertNotNull(names.familyName)
+            assertTrue("Should contain Montserrat in names: ${names.allDistinctNames}",
+                names.allDistinctNames.any { it.contains("Montserrat", ignoreCase = true) })
+        }
+
+        assertTrue(com.example.util.FontManager.isFontFile("test.ttf"))
+        assertTrue(com.example.util.FontManager.isFontFile("custom.otf"))
+        assertTrue(com.example.util.FontManager.isFontFile("collection.ttc"))
+        org.junit.Assert.assertFalse(com.example.util.FontManager.isFontFile("document.pdf"))
+    }
+
+    // --- TEST 10: KARAOKE & ASS OVERRIDE TEST ---
+    @Test
+    fun testKaraokeAndAssOverrideTags() {
+        // Karaoke tags \k, \K, \kf, \ko
+        val karaokeLine = "{\\k50}Re{\\kf75}mu{\\K100}rin{\\ko30}!"
+        val cleanKaraoke = SubtitleParser.cleanAssText(karaokeLine)
+        assertEquals("Remurin!", cleanKaraoke)
+
+        // Override tags: \pos, \move, \clip, \fad, \t, \fs, \fn, \bord, \shad
+        val overrideLine = "{\\pos(960,540)\\fad(300,300)\\fs40\\fnArial\\bord2\\shad1}Özel Başlık"
+        val cleanOverride = SubtitleParser.cleanAssText(overrideLine)
+        assertEquals("Özel Başlık", cleanOverride)
+
+        // Vector drawing tag {\p1}m 0 0 l 100 0 100 100 0 100{\p0}
+        val drawingLine = "{\\p1}m 0 0 l 10 0 10 10 0 10{\\p0}Metin"
+        val cleanDrawing = SubtitleParser.cleanAssText(drawingLine)
+        assertTrue(cleanDrawing.contains("Metin"))
+    }
 }

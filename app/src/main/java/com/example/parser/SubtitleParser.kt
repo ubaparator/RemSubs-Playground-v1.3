@@ -68,7 +68,8 @@ object SubtitleParser {
                 }
 
                 val rawText = textBuilder.toString()
-                val cleanText = cleanHtmlTags(rawText)
+                val assConverted = HtmlSubtitleParser.htmlToAss(rawText)
+                val cleanText = HtmlSubtitleParser.cleanToPlainText(rawText)
 
                 if (cleanText.isNotBlank()) {
                     cues.add(
@@ -76,7 +77,7 @@ object SubtitleParser {
                             id = cueIndex++,
                             startTimeMs = startMs,
                             endTimeMs = endMs,
-                            rawText = rawText,
+                            rawText = assConverted,
                             cleanText = cleanText
                         )
                     )
@@ -108,7 +109,8 @@ object SubtitleParser {
                         }
 
                         val rawText = textBuilder.toString()
-                        val cleanText = cleanHtmlTags(rawText)
+                        val assConverted = HtmlSubtitleParser.htmlToAss(rawText)
+                        val cleanText = HtmlSubtitleParser.cleanToPlainText(rawText)
 
                         if (cleanText.isNotBlank()) {
                             cues.add(
@@ -116,7 +118,7 @@ object SubtitleParser {
                                     id = cueIndex++,
                                     startTimeMs = startMs,
                                     endTimeMs = endMs,
-                                    rawText = rawText,
+                                    rawText = assConverted,
                                     cleanText = cleanText
                                 )
                             )
@@ -263,7 +265,6 @@ object SubtitleParser {
     fun parseAssDefaultStyle(content: String, targetPlayResY: Int = 1080): SubtitleStyle? {
         val scriptRes = extractScriptResolution(content)
         val playResY = scriptRes?.second ?: targetPlayResY
-        val scale = playResY.toFloat() / 216f
 
         var formatColumns = listOf(
             "Name", "Fontname", "Fontsize", "PrimaryColour", "SecondaryColour",
@@ -302,8 +303,8 @@ object SubtitleParser {
             }
 
             val fontName = colMap["fontname"] ?: "Arial"
-            val rawFontSize = colMap["fontsize"]?.toFloatOrNull() ?: 50f
-            val fontSizeSp = (rawFontSize / scale).coerceIn(14f, 44f)
+            val rawFontSize = colMap["fontsize"]?.toFloatOrNull() ?: 48f
+            val fontSizeSp = rawFontSize.coerceIn(12f, 160f)
 
             val primaryColStr = colMap["primarycolour"] ?: "&H00FFFFFF"
             val textColor = parseAssColor(primaryColStr) ?: Color.White
@@ -320,7 +321,7 @@ object SubtitleParser {
             val borderStyle = colMap["borderstyle"]?.toIntOrNull() ?: 1
 
             val rawOutline = colMap["outline"]?.toFloatOrNull() ?: 2.5f
-            val outlineWidth = (rawOutline / scale).coerceIn(1f, 6f)
+            val outlineWidth = rawOutline.coerceIn(0f, 20f)
 
             val alignNum = colMap["alignment"]?.toIntOrNull() ?: 2
             val (vAlign, hAlign) = when (alignNum) {
@@ -336,10 +337,10 @@ object SubtitleParser {
             }
 
             val rawMarginV = colMap["marginv"]?.toFloatOrNull() ?: 40f
-            val verticalOffsetDp = (rawMarginV / scale).coerceIn(0f, 100f)
+            val verticalOffsetDp = rawMarginV.coerceIn(0f, 300f)
 
             val rawMarginL = colMap["marginl"]?.toFloatOrNull() ?: 20f
-            val horizontalPaddingDp = (rawMarginL / scale).coerceIn(4f, 60f)
+            val horizontalPaddingDp = rawMarginL.coerceIn(0f, 200f)
 
             return SubtitleStyle(
                 fontName = fontName,
@@ -421,23 +422,11 @@ object SubtitleParser {
     }
 
     private fun cleanHtmlTags(text: String): String {
-        return text.replace(Regex("<[^>]*>"), "")
-            .replace("&nbsp;", " ")
-            .replace("&amp;", "&")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .trim()
+        return HtmlSubtitleParser.cleanToPlainText(text)
     }
 
     fun cleanAssText(text: String): String {
-        return text
-            // Replace ASS newline tags \N or \n with standard newline
-            .replace("\\N", "\n")
-            .replace("\\n", "\n")
-            .replace("\\h", " ")
-            // Strip ASS override tags in curly braces like {\b1}, {\pos(x,y)}, etc.
-            .replace(Regex("\\{[^}]*\\}"), "")
-            .trim()
+        return HtmlSubtitleParser.cleanToPlainText(text)
     }
 
     /**
@@ -487,5 +476,31 @@ Seçtiğiniz video lokalden önizlenir.
 00:00:13,500 --> 00:00:18,000
 Eş zamanlı altyazı önizlemesi ve zamanlama ayarı!
         """.trimIndent()
+    }
+
+    /**
+     * Exports a list of SubtitleCue elements to standard SubRip (.srt) format.
+     */
+    fun exportToSrt(cues: List<SubtitleCue>): String {
+        val sb = StringBuilder()
+        cues.sortedBy { it.startTimeMs }.forEachIndexed { index, cue ->
+            sb.append(index + 1).append("\n")
+            sb.append(formatSrtTimestamp(cue.startTimeMs))
+            sb.append(" --> ")
+            sb.append(formatSrtTimestamp(cue.endTimeMs))
+            sb.append("\n")
+            sb.append(cue.cleanText)
+            sb.append("\n\n")
+        }
+        return sb.toString().trimEnd() + "\n"
+    }
+
+    fun formatSrtTimestamp(ms: Long): String {
+        val totalSeconds = ms / 1000
+        val millis = ms % 1000
+        val seconds = totalSeconds % 60
+        val minutes = (totalSeconds / 60) % 60
+        val hours = totalSeconds / 3600
+        return String.format(java.util.Locale.ROOT, "%02d:%02d:%02d,%03d", hours, minutes, seconds, millis)
     }
 }

@@ -53,6 +53,7 @@ import androidx.compose.ui.unit.sp
 import com.example.torrent.TorrentDownloadInfo
 import com.example.torrent.TorrentErrorType
 import com.example.torrent.TorrentState
+import com.example.util.MediaStorageManager
 import java.io.File
 
 @Composable
@@ -64,9 +65,11 @@ fun TorrentDownloadSection(
     onResume: () -> Unit,
     onCancel: () -> Unit,
     onOpenDownloadedVideo: (File) -> Unit,
+    onSelectVideoFile: (String) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var magnetInput by remember { mutableStateOf("") }
+    var showFileList by remember { mutableStateOf(false) }
 
     Card(
         shape = RoundedCornerShape(16.dp),
@@ -296,6 +299,127 @@ fun TorrentDownloadSection(
                                 fontWeight = FontWeight.Medium,
                                 color = MaterialTheme.colorScheme.outline
                             )
+                        }
+
+                        if (downloadInfo.pieceCount > 0) {
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = "Parça: ${downloadInfo.pieceCount} (${TorrentDownloadInfo.formatBytes(downloadInfo.pieceSize.toLong())}/parça)",
+                                    fontSize = 10.sp,
+                                    color = MaterialTheme.colorScheme.outline
+                                )
+                                if (downloadInfo.files.size > 1) {
+                                    Text(
+                                        text = "Dosyalar: ${downloadInfo.files.size} dosya (Seçili: Video)",
+                                        fontSize = 10.sp,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                            }
+                        }
+
+                        if (downloadInfo.files.size > 1) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Torrent Dosyaları (${downloadInfo.files.size})",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                                OutlinedButton(
+                                    onClick = { showFileList = !showFileList },
+                                    shape = RoundedCornerShape(6.dp),
+                                    modifier = Modifier.testTag("btn_toggle_torrent_file_list")
+                                ) {
+                                    Text(
+                                        text = if (showFileList) "Gizle" else "Dosyaları Seç",
+                                        fontSize = 10.sp
+                                    )
+                                }
+                            }
+
+                            if (showFileList) {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .background(
+                                            MaterialTheme.colorScheme.surface.copy(alpha = 0.7f),
+                                            RoundedCornerShape(8.dp)
+                                        )
+                                        .padding(8.dp)
+                                ) {
+                                    downloadInfo.files.forEach { filePath ->
+                                        val isVideo = MediaStorageManager.isVideoFile(filePath)
+                                        val isSelected = filePath == downloadInfo.selectedVideoFileName
+                                        val displayName = filePath.substringAfterLast("/")
+
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(vertical = 4.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Icon(
+                                                imageVector = if (isVideo) Icons.Default.Movie else Icons.Default.FileOpen,
+                                                contentDescription = null,
+                                                tint = if (isVideo) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = displayName,
+                                                    fontSize = 11.sp,
+                                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                                    color = if (isVideo) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.outline
+                                                )
+                                                if (!isVideo) {
+                                                    Text(
+                                                        text = "Video değil (Atlanıyor)",
+                                                        fontSize = 9.sp,
+                                                        color = MaterialTheme.colorScheme.outline
+                                                    )
+                                                }
+                                            }
+                                            if (isVideo) {
+                                                if (isSelected) {
+                                                    Surface(
+                                                        shape = RoundedCornerShape(4.dp),
+                                                        color = MaterialTheme.colorScheme.primaryContainer
+                                                    ) {
+                                                        Text(
+                                                            text = "Seçili",
+                                                            fontSize = 10.sp,
+                                                            fontWeight = FontWeight.Bold,
+                                                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                        )
+                                                    }
+                                                } else {
+                                                    OutlinedButton(
+                                                        onClick = { onSelectVideoFile(filePath) },
+                                                        shape = RoundedCornerShape(4.dp),
+                                                        modifier = Modifier.testTag("btn_select_file_$displayName")
+                                                    ) {
+                                                        Text("Seç", fontSize = 10.sp)
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f))
+                                    }
+                                }
+                            }
                         }
 
                         Spacer(modifier = Modifier.height(12.dp))

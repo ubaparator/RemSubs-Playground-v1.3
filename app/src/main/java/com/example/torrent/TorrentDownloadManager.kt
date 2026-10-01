@@ -5,6 +5,21 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.net.Uri
 import android.util.Log
+import com.example.util.MediaStorageManager
+import com.frostwire.jlibtorrent.AlertListener
+import com.frostwire.jlibtorrent.Priority
+import com.frostwire.jlibtorrent.SessionManager
+import com.frostwire.jlibtorrent.Sha1Hash
+import com.frostwire.jlibtorrent.TorrentHandle
+import com.frostwire.jlibtorrent.TorrentInfo
+import com.frostwire.jlibtorrent.TorrentStatus
+import com.frostwire.jlibtorrent.alerts.Alert
+import com.frostwire.jlibtorrent.alerts.AlertType
+import com.frostwire.jlibtorrent.alerts.MetadataReceivedAlert
+import com.frostwire.jlibtorrent.alerts.PieceFinishedAlert
+import com.frostwire.jlibtorrent.alerts.SaveResumeDataAlert
+import com.frostwire.jlibtorrent.alerts.TorrentErrorAlert
+import com.frostwire.jlibtorrent.alerts.TorrentFinishedAlert
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -16,81 +31,718 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import java.io.ByteArrayInputStream
 import java.io.File
-import java.io.FileOutputStream
-import java.io.RandomAccessFile
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
-import java.net.InetSocketAddress
-import java.net.Socket
-import java.net.URLDecoder
-import java.nio.ByteBuffer
-import java.nio.charset.StandardCharsets
-import java.security.MessageDigest
-import java.util.ArrayDeque
 import java.util.Locale
-import java.util.concurrent.TimeUnit
 
+/**
+ * Production-grade BitTorrent client using FrostWire jlibtorrent (libtorrent 2.0+).
+ * Completely eliminates any fake progress, fake delays, hardcoded sizes, or sample media copying.
+ * Handles true end-to-end BitTorrent pipeline:
+ * Magnet / .torrent -> Metadata -> DHT/Trackers -> Peer Discovery -> Piece Requests ->
+ * SHA-1 Verification -> Piece Assembly -> Complete File -> Media Validation -> MediaStore (Movies/RemSubs) -> Gallery.
+ */
 object TorrentDownloadManager {
     private const val TAG = "TorrentDownloadManager"
 
     private val _downloadInfo = MutableStateFlow(TorrentDownloadInfo())
     val downloadInfo: StateFlow<TorrentDownloadInfo> = _downloadInfo.asStateFlow()
 
-    private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(8, TimeUnit.SECONDS)
-        .build()
-
     private val scope = CoroutineScope(Dispatchers.IO)
-    private var downloadJob: Job? = null
-    private var speedMonitorJob: Job? = null
+    private var downloadMonitorJob: Job? = null
 
-    private val peerId = generatePeerId()
-    private val speedHistory = ArrayDeque<Pair<Long, Long>>() // timestampMs to bytes
+    private var _sessionManager: SessionManager? = null
+    val sessionManager: SessionManager?
+        get() {
+            if (_sessionManager == null) {
+                try {
+                    val sm = SessionManager()
+                    registerSessionAlerts(sm)
+                    _sessionManager = sm
+                } catch (t: Throwable) {
+                    Log.e(TAG, "jlibtorrent native library not available in this environment: ${t.localizedMessage}", t)
+                }
+            }
+            return _sessionManager
+        }
 
-    private var activeOutputFile: File? = null
-    private var activeTargetFileName: String = ""
+    private var activeHandle: TorrentHandle? = null
+    private var activeTorrentInfo: TorrentInfo? = null
+    private var activeDownloadDir: File? = null
     private var activeContext: Context? = null
-    private var isPaused = false
+    private var isListenerRegistered = false
 
-    private val defaultTrackers = listOf(
-        "http://tracker.openbittorrent.com:80/announce",
-        "udp://tracker.opentrackr.org:1337/announce",
-        "udp://open.tracker.cl:1337/announce",
-        "udp://tracker.torrent.eu.org:451/announce"
-    )
+    private fun registerSessionAlerts(sm: SessionManager) {
+        if (isListenerRegistered) return
+        try {
+            sm.addListener(object : AlertListener {
+                override fun types(): IntArray? = null // receive all alerts
 
-    fun classifyError(t: Throwable): Pair<TorrentErrorType, String> {
-        val msg = t.message ?: ""
+                override fun alert(alert: Alert<*>) {
+                    when (alert.type()) {
+                        AlertType.METADATA_RECEIVED -> {
+                            val metaAlert = alert as? MetadataReceivedAlert
+                            Log.i(TAG, "[ALERT] metadata_received: ${metaAlert?.torrentName() ?: alert.message()}")
+                            handleMetadataReceived(metaAlert?.handle())
+                        }
+                        AlertType.TORRENT_CHECKED -> {
+                            Log.i(TAG, "[ALERT] torrent_checked: ${alert.message()}")
+                        }
+                        AlertType.PIECE_FINISHED -> {
+                            val pieceAlert = alert as? PieceFinishedAlert
+                            val pieceIdx = pieceAlert?.pieceIndex() ?: -1
+                            Log.d(TAG, "[ALERT] piece_finished: piece=$pieceIdx ${alert.message()}")
+                        }
+                        AlertType.TORRENT_FINISHED -> {
+                            val finishedAlert = alert as? TorrentFinishedAlert
+                            Log.i(TAG, "[ALERT] torrent_finished: ${finishedAlert?.torrentName() ?: alert.message()}")
+                            scope.launch { onDownloadCompleted() }
+                        }
+                        AlertType.TORRENT_ERROR -> {
+                            val errorAlert = alert as? TorrentErrorAlert
+                            Log.e(TAG, "[ALERT] torrent_error: ${errorAlert?.error()?.message() ?: alert.message()}")
+                            val (errType, desc) = classifyErrorMessage(errorAlert?.error()?.message() ?: alert.message())
+                            _downloadInfo.update {
+                                it.copy(
+                                    state = TorrentState.ERROR,
+                                    errorMessage = desc,
+                                    errorType = errType,
+                                    statusMessage = "Hata: $desc"
+                                )
+                            }
+                        }
+                        AlertType.SAVE_RESUME_DATA -> {
+                            val resumeAlert = alert as? SaveResumeDataAlert
+                            Log.i(TAG, "[ALERT] save_resume_data: ${resumeAlert?.torrentName() ?: alert.message()}")
+                        }
+                        else -> {}
+                    }
+                }
+            })
+            isListenerRegistered = true
+        } catch (t: Throwable) {
+            Log.e(TAG, "Failed to register alert listener: ${t.localizedMessage}")
+        }
+    }
+
+    private fun ensureSessionStarted(): Boolean {
+        return try {
+            val sm = sessionManager ?: return false
+            if (!sm.isRunning) {
+                Log.i(TAG, "Starting jlibtorrent SessionManager (DHT + Peer Exchange)...")
+                sm.start()
+            }
+            true
+        } catch (e: Throwable) {
+            Log.e(TAG, "Failed to start jlibtorrent session: ${e.localizedMessage}", e)
+            false
+        }
+    }
+
+    fun classifyErrorMessage(message: String?): Pair<TorrentErrorType, String> {
+        val msg = message ?: ""
         val lower = msg.lowercase(Locale.ROOT)
         return when {
-            lower.contains("timeout") || lower.contains("timed out") || lower.contains("metadata") ->
-                Pair(TorrentErrorType.METADATA_TIMEOUT, "Metadata zaman aşımı: İzleyiciler veya eşler yanıt vermedi.")
-            lower.contains("no peer") || lower.contains("empty peer") || lower.contains("zero peers") ->
-                Pair(TorrentErrorType.NO_PEERS, "Kullanılabilir eş (peer) veya seeder bulunamadı.")
+            lower.contains("timeout") || lower.contains("metadata") ->
+                Pair(TorrentErrorType.METADATA_TIMEOUT, "Metadata zaman aşımı (Tracker/Peer yanıt vermedi)")
+            lower.contains("no peer") || lower.contains("zero peers") ->
+                Pair(TorrentErrorType.NO_PEERS, "Kullanılabilir eş (peer) veya seeder bulunamadı")
             lower.contains("tracker") ->
-                Pair(TorrentErrorType.TRACKER_ERROR, "İzleyici (tracker) bağlantı hatası: ${t.localizedMessage}")
+                Pair(TorrentErrorType.TRACKER_ERROR, "İzleyici (Tracker) bağlantı hatası")
             lower.contains("dht") ->
-                Pair(TorrentErrorType.DHT_ERROR, "DHT ağı yanıt vermedi.")
-            lower.contains("permission") || lower.contains("eacces") || lower.contains("denied") ->
-                Pair(TorrentErrorType.PERMISSION, "Depolama yazma izni reddedildi: ${t.localizedMessage}")
-            lower.contains("space") || lower.contains("full") || lower.contains("enospc") ->
-                Pair(TorrentErrorType.STORAGE_FULL, "Cihaz depolama alanı yetersiz.")
-            lower.contains("bencode") || lower.contains("invalid torrent") || lower.contains("torrent file") ->
-                Pair(TorrentErrorType.INVALID_TORRENT, "Geçersiz veya bozuk .torrent dosyası.")
-            lower.contains("magnet") || lower.contains("urn:btih") ->
-                Pair(TorrentErrorType.INVALID_MAGNET, "Geçersiz veya desteklenmeyen Magnet bağlantısı.")
-            lower.contains("connect") || lower.contains("network") || lower.contains("unreachable") || lower.contains("route") ->
-                Pair(TorrentErrorType.NETWORK_ERROR, "Ağ bağlantısı hatası: İnternet erişiminizi kontrol edin.")
-            lower.contains("init") || lower.contains("engine") || lower.contains("session") ->
-                Pair(TorrentErrorType.ENGINE_INIT_FAILURE, "Torrent motoru başlatılamadı: ${t.localizedMessage}")
+                Pair(TorrentErrorType.DHT_ERROR, "DHT ağı yanıt vermedi")
+            lower.contains("permission") || lower.contains("denied") ->
+                Pair(TorrentErrorType.PERMISSION, "Depolama yazma izni reddedildi")
+            lower.contains("space") || lower.contains("full") ->
+                Pair(TorrentErrorType.STORAGE_FULL, "Cihaz depolama alanı yetersiz")
+            lower.contains("magnet") ->
+                Pair(TorrentErrorType.INVALID_MAGNET, "Geçersiz veya desteklenmeyen Magnet URI")
+            lower.contains("torrent") || lower.contains("bencode") || lower.contains("invalid") ->
+                Pair(TorrentErrorType.INVALID_TORRENT, "Geçersiz veya bozuk .torrent dosyası")
+            lower.contains("engine") ->
+                Pair(TorrentErrorType.ENGINE_INIT_FAILURE, "BitTorrent motoru başlatılamadı")
+            lower.contains("network") || lower.contains("connect") ->
+                Pair(TorrentErrorType.NETWORK_ERROR, "Ağ bağlantısı hatası")
             else ->
-                Pair(TorrentErrorType.UNKNOWN, "İndirme hatası: ${t.localizedMessage ?: "Bilinmeyen hata"}")
+                Pair(TorrentErrorType.UNKNOWN, msg.ifBlank { "Bilinmeyen indirme hatası" })
+        }
+    }
+
+    fun classifyError(t: Throwable): Pair<TorrentErrorType, String> {
+        return classifyErrorMessage(t.localizedMessage ?: t.message)
+    }
+
+    /**
+     * Starts download from a Magnet URI.
+     * Enforces real BitTorrent protocol without size guessing before metadata arrival.
+     */
+    fun startMagnetDownload(context: Context, magnetUri: String) {
+        cancelDownload()
+        activeContext = context.applicationContext
+
+        val targetDir = context.getExternalFilesDir("torrent_downloads")
+            ?: File(context.cacheDir, "torrent_downloads")
+        targetDir.mkdirs()
+        activeDownloadDir = targetDir
+
+        // Extract infohash if present in URI
+        val infoHashHex = extractInfoHashFromMagnet(magnetUri)
+
+        _downloadInfo.value = TorrentDownloadInfo(
+            magnetUri = magnetUri,
+            infoHashHex = infoHashHex,
+            state = TorrentState.RESOLVING_METADATA,
+            statusMessage = "Magnet meta verisi aranıyor (Trackers & DHT)...",
+            totalBytes = 0L,
+            downloadedBytes = 0L,
+            progress = 0f,
+            progressPercentage = 0
+        )
+        logTorrentSnapshot(stateOverride = TorrentState.RESOLVING_METADATA.name)
+
+        scope.launch {
+            try {
+                if (!ensureSessionStarted()) {
+                    throw IllegalStateException("engine init failure: jlibtorrent session could not start")
+                }
+                val sm = sessionManager ?: throw IllegalStateException("engine init failure")
+
+                // Try fetching metadata first with timeout
+                Log.i(TAG, "Fetching magnet metadata via jlibtorrent fetchMagnet: $magnetUri")
+                val metaBytes = withContext(Dispatchers.IO) {
+                    try {
+                        sm.fetchMagnet(magnetUri, 25, targetDir)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "fetchMagnet exception: ${e.localizedMessage}")
+                        null
+                    }
+                }
+
+                if (metaBytes != null && metaBytes.isNotEmpty()) {
+                    Log.i(TAG, "Magnet metadata successfully received (${metaBytes.size} bytes)")
+                    val ti = TorrentInfo(metaBytes)
+                    onMetadataAcquired(ti, targetDir)
+                } else {
+                    Log.i(TAG, "fetchMagnet timed out or returned null, queueing magnet URI directly in session...")
+                    _downloadInfo.update {
+                        it.copy(
+                            statusMessage = "Eşler aranıyor ve meta verisi bekleniyor...",
+                            state = TorrentState.CONNECTING_TRACKERS
+                        )
+                    }
+                    // Download via magnet URI directly
+                    sm.download(magnetUri, targetDir, null)
+                    findAndTrackHandle(infoHashHex)
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "startMagnetDownload error: ${t.localizedMessage}", t)
+                val (errType, desc) = classifyError(t)
+                _downloadInfo.update {
+                    it.copy(
+                        state = TorrentState.ERROR,
+                        errorMessage = desc,
+                        errorType = errType,
+                        statusMessage = "Hata: $desc"
+                    )
+                }
+                logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = desc)
+            }
+        }
+    }
+
+    /**
+     * Starts download from a user-selected .torrent file.
+     * ContentResolver reads byte payload into true TorrentInfo metadata.
+     */
+    fun startTorrentFileDownload(context: Context, torrentUri: Uri) {
+        cancelDownload()
+        activeContext = context.applicationContext
+
+        val targetDir = context.getExternalFilesDir("torrent_downloads")
+            ?: File(context.cacheDir, "torrent_downloads")
+        targetDir.mkdirs()
+        activeDownloadDir = targetDir
+
+        _downloadInfo.value = TorrentDownloadInfo(
+            state = TorrentState.RESOLVING_METADATA,
+            statusMessage = ".torrent dosyası okunuyor...",
+            totalBytes = 0L,
+            downloadedBytes = 0L,
+            progress = 0f,
+            progressPercentage = 0
+        )
+        logTorrentSnapshot(stateOverride = TorrentState.RESOLVING_METADATA.name)
+
+        scope.launch {
+            try {
+                val bytes = withContext(Dispatchers.IO) {
+                    context.contentResolver.openInputStream(torrentUri)?.use { it.readBytes() }
+                }
+
+                if (bytes == null || bytes.isEmpty()) {
+                    val errPair = Pair(TorrentErrorType.INVALID_TORRENT, ".torrent dosyası okunamadı veya boş.")
+                    _downloadInfo.update {
+                        it.copy(
+                            state = TorrentState.ERROR,
+                            errorMessage = errPair.second,
+                            errorType = errPair.first,
+                            statusMessage = errPair.second
+                        )
+                    }
+                    logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errPair.second)
+                    return@launch
+                }
+
+                ensureSessionStarted()
+
+                val ti = try {
+                    TorrentInfo(bytes)
+                } catch (e: Exception) {
+                    val errPair = Pair(TorrentErrorType.INVALID_TORRENT, "Geçersiz .torrent dosyası: ${e.localizedMessage}")
+                    _downloadInfo.update {
+                        it.copy(
+                            state = TorrentState.ERROR,
+                            errorMessage = errPair.second,
+                            errorType = errPair.first,
+                            statusMessage = errPair.second
+                        )
+                    }
+                    logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errPair.second)
+                    return@launch
+                }
+
+                onMetadataAcquired(ti, targetDir)
+
+            } catch (t: Throwable) {
+                Log.e(TAG, "startTorrentFileDownload error: ${t.localizedMessage}", t)
+                val (errType, desc) = classifyError(t)
+                _downloadInfo.update {
+                    it.copy(
+                        state = TorrentState.ERROR,
+                        errorMessage = desc,
+                        errorType = errType,
+                        statusMessage = "Hata: $desc"
+                    )
+                }
+                logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = desc)
+            }
+        }
+    }
+
+    private fun onMetadataAcquired(ti: TorrentInfo, targetDir: File) {
+        activeTorrentInfo = ti
+        val name = ti.name()
+        val totalSize = ti.totalSize()
+        val numPieces = ti.numPieces()
+        val pieceLen = ti.pieceLength()
+        val infoHashHex = ti.infoHash().toHex()
+        val fileStorage = ti.files()
+        val numFiles = fileStorage.numFiles()
+
+        val fileList = mutableListOf<String>()
+        for (i in 0 until numFiles) {
+            fileList.add(fileStorage.filePath(i))
+        }
+
+        // Multi-file handling: identify primary video file and configure priorities
+        var selectedVideo = ""
+        val priorities = Array(numFiles) { i ->
+            val path = fileStorage.filePath(i)
+            if (MediaStorageManager.isVideoFile(path)) {
+                if (selectedVideo.isEmpty()) selectedVideo = path
+                Priority.fromSwig(4)
+            } else {
+                Priority.IGNORE
+            }
+        }
+
+        // If no file matched video extensions, default all files to DEFAULT
+        if (selectedVideo.isEmpty() && numFiles > 0) {
+            selectedVideo = fileStorage.filePath(0)
+            for (i in priorities.indices) priorities[i] = Priority.fromSwig(4)
+        }
+
+        Log.i(TAG, """
+            [TORRENT METADATA ACQUIRED]
+            TORRENT NAME: $name
+            INFOHASH: $infoHashHex
+            TOTAL SIZE: $totalSize (${TorrentDownloadInfo.formatBytes(totalSize)})
+            PIECE COUNT: $numPieces
+            PIECE SIZE: $pieceLen
+            FILES: ${fileList.joinToString(", ")}
+            SELECTED VIDEO: $selectedVideo
+        """.trimIndent())
+
+        _downloadInfo.update {
+            it.copy(
+                torrentName = name,
+                infoHashHex = infoHashHex,
+                totalBytes = totalSize,
+                pieceCount = numPieces,
+                pieceSize = pieceLen,
+                files = fileList,
+                selectedVideoFileName = selectedVideo,
+                state = TorrentState.DOWNLOADING,
+                statusMessage = "İndiriliyor"
+            )
+        }
+        logTorrentSnapshot(stateOverride = TorrentState.DOWNLOADING.name)
+
+        // Queue download in jlibtorrent session
+        val sm = sessionManager ?: throw IllegalStateException("engine init failure: jlibtorrent not available")
+        try {
+            sm.download(ti, targetDir, null, priorities, null, null)
+        } catch (_: Exception) {
+            sm.download(ti, targetDir)
+        }
+
+        val handle = sm.find(ti.infoHash())
+        activeHandle = handle
+
+        startStatusMonitor()
+    }
+
+    private fun handleMetadataReceived(handle: TorrentHandle?) {
+        val h = handle ?: activeHandle ?: return
+        if (!h.isValid) return
+        val ti = h.torrentFile() ?: return
+        if (activeTorrentInfo == null) {
+            activeDownloadDir?.let { onMetadataAcquired(ti, it) }
+        }
+    }
+
+    private fun findAndTrackHandle(infoHashHex: String) {
+        if (infoHashHex.isNotBlank()) {
+            try {
+                val hash = Sha1Hash(infoHashHex)
+                val handle = sessionManager?.find(hash)
+                if (handle != null && handle.isValid) {
+                    activeHandle = handle
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "find handle warning: ${e.localizedMessage}")
+            }
+        }
+        startStatusMonitor()
+    }
+
+    private fun startStatusMonitor() {
+        downloadMonitorJob?.cancel()
+        downloadMonitorJob = scope.launch {
+            while (isActive) {
+                delay(500)
+                val handle = activeHandle ?: run {
+                    val hash = _downloadInfo.value.infoHashHex
+                    if (hash.isNotBlank()) {
+                        try {
+                            sessionManager?.find(Sha1Hash(hash))
+                        } catch (_: Exception) { null }
+                    } else null
+                }
+                activeHandle = handle
+
+                if (handle != null && handle.isValid) {
+                    val status = handle.status()
+                    val totalDone = status.totalDone()
+                    val total = if (status.total() > 0) status.total() else _downloadInfo.value.totalBytes
+                    val progress = if (total > 0) (totalDone.toFloat() / total.toFloat()).coerceIn(0f, 1f) else status.progress()
+                    val pct = (progress * 100).toInt()
+                    val rate = status.downloadPayloadRate().toLong()
+                    val peers = status.numPeers()
+                    val seeds = status.numSeeds()
+                    val state = status.state()
+
+                    val speedText = formatSpeed(rate)
+                    val etaSec = if (rate > 1024L && total > totalDone) {
+                        (total - totalDone) / rate
+                    } else 0L
+                    val etaText = if (etaSec > 0) formatEta(etaSec) else "--:--"
+
+                    // Log snapshot according to user requirement 12
+                    Log.i(TAG, """
+                        [TORRENT]
+                        state=${state.name}
+                        total=${TorrentDownloadInfo.formatBytes(total)}
+                        downloaded=${TorrentDownloadInfo.formatBytes(totalDone)}
+                        progress=${String.format(Locale.US, "%.1f%%", progress * 100f)}
+                        speed=$speedText
+                        peers=$peers
+                        seeds=$seeds
+                    """.trimIndent())
+
+                    _downloadInfo.update {
+                        it.copy(
+                            downloadedBytes = totalDone,
+                            totalBytes = total,
+                            progress = progress,
+                            progressPercentage = pct,
+                            speedBytesPerSec = rate,
+                            speedText = speedText,
+                            etaText = etaText,
+                            connectedPeers = peers,
+                            seeders = seeds,
+                            state = if (status.isFinished || state == TorrentStatus.State.FINISHED || state == TorrentStatus.State.SEEDING) {
+                                TorrentState.COMPLETED
+                            } else {
+                                TorrentState.DOWNLOADING
+                            },
+                            statusMessage = if (status.isFinished) "İndirme tamamlandı" else "İndiriliyor"
+                        )
+                    }
+
+                    if (status.isFinished || state == TorrentStatus.State.FINISHED || state == TorrentStatus.State.SEEDING) {
+                        onDownloadCompleted()
+                        break
+                    }
+                }
+            }
+        }
+    }
+
+    private suspend fun onDownloadCompleted() {
+        downloadMonitorJob?.cancel()
+        downloadMonitorJob = null
+
+        val context = activeContext ?: return
+        val targetDir = activeDownloadDir ?: return
+        val info = _downloadInfo.value
+
+        _downloadInfo.update {
+            it.copy(
+                state = TorrentState.TRANSFERRING,
+                statusMessage = "İndirilen medya dosyası doğrulanıyor...",
+                speedText = "Doğrulanıyor",
+                etaText = "--:--"
+            )
+        }
+
+        // Find primary completed video file
+        val targetFile = resolveDownloadedFile(targetDir, info.selectedVideoFileName, info.torrentName)
+        if (targetFile == null || !targetFile.exists() || targetFile.length() <= 0L) {
+            Log.e(TAG, "Torrent completion error: Target file not found or empty.")
+            _downloadInfo.update {
+                it.copy(
+                    state = TorrentState.ERROR,
+                    errorMessage = "İndirilen dosya bulunamadı veya boş.",
+                    errorType = TorrentErrorType.UNKNOWN,
+                    statusMessage = "Hata"
+                )
+            }
+            return
+        }
+
+        // Validate video stream and media container integrity
+        val validation = validateMediaFile(targetFile)
+        if (validation is MediaValidationResult.Invalid) {
+            Log.e(TAG, "Media validation failure: ${validation.reason}")
+            _downloadInfo.update {
+                it.copy(
+                    state = TorrentState.ERROR,
+                    errorMessage = "İndirilen dosya doğrulanamadı: ${validation.reason}",
+                    errorType = TorrentErrorType.UNKNOWN,
+                    statusMessage = "Hata"
+                )
+            }
+            return
+        }
+
+        _downloadInfo.update {
+            it.copy(
+                state = TorrentState.TRANSFERRING,
+                statusMessage = "Galeriye ve Movies/RemSubs klasörüne kaydediliyor...",
+                speedText = "Kaydediliyor"
+            )
+        }
+
+        // Save to Gallery under Movies/RemSubs/ preserving true container (.mkv, .mp4, .webm)
+        val saveResult = MediaStorageManager.saveVideoToGallery(
+            context = context,
+            sourceFile = targetFile,
+            originalFileName = targetFile.name
+        )
+
+        when (saveResult) {
+            is StorageSaveResult.Success -> {
+                Log.i(TAG, """
+                    [TORRENT]
+                    state=COMPLETED
+                    path=${saveResult.permanentFile.absolutePath}
+                    size=${saveResult.permanentFile.length()}
+                """.trimIndent())
+
+                _downloadInfo.update {
+                    it.copy(
+                        state = TorrentState.COMPLETED,
+                        statusMessage = "İndirme tamamlandı ve Galeriye kaydedildi",
+                        progress = 1.0f,
+                        progressPercentage = 100,
+                        speedText = "0 KB/s",
+                        etaText = "00:00",
+                        downloadedFile = saveResult.permanentFile,
+                        permanentUri = saveResult.permanentUri,
+                        errorMessage = null,
+                        errorType = null
+                    )
+                }
+                logTorrentSnapshot(stateOverride = TorrentState.COMPLETED.name)
+            }
+            is StorageSaveResult.Failure -> {
+                Log.e(TAG, "Gallery save failed: ${saveResult.reason}")
+                _downloadInfo.update {
+                    it.copy(
+                        state = TorrentState.ERROR,
+                        errorMessage = saveResult.reason,
+                        errorType = TorrentErrorType.UNKNOWN,
+                        statusMessage = "Hata"
+                    )
+                }
+            }
+        }
+    }
+
+    private fun resolveDownloadedFile(targetDir: File, selectedFileName: String, torrentName: String): File? {
+        if (selectedFileName.isNotBlank()) {
+            val f = File(targetDir, selectedFileName)
+            if (f.exists() && f.length() > 0L) return f
+        }
+
+        // Search recursively inside targetDir for any video file
+        val allFiles = targetDir.walkTopDown().filter { it.isFile && MediaStorageManager.isVideoFile(it.name) }.toList()
+        if (allFiles.isNotEmpty()) {
+            // Return largest video file (typically the primary movie/episode)
+            return allFiles.maxByOrNull { it.length() }
+        }
+
+        // Check if any file exists matching torrentName
+        val named = File(targetDir, torrentName)
+        if (named.exists() && named.length() > 0L) return named
+
+        // Fallback to any non-empty file
+        return targetDir.walkTopDown().filter { it.isFile && it.length() > 0L }.maxByOrNull { it.length() }
+    }
+
+    private sealed class MediaValidationResult {
+        object Valid : MediaValidationResult()
+        data class Invalid(val reason: String) : MediaValidationResult()
+    }
+
+    private fun validateMediaFile(file: File): MediaValidationResult {
+        if (!file.exists() || !file.canRead() || file.length() <= 0L) {
+            return MediaValidationResult.Invalid("Dosya bulunamadı veya boş.")
+        }
+
+        if (MediaStorageManager.isVideoFile(file.name)) {
+            val extractor = MediaExtractor()
+            return try {
+                extractor.setDataSource(file.absolutePath)
+                val trackCount = extractor.trackCount
+                if (trackCount <= 0) {
+                    return MediaValidationResult.Invalid("Dosyada medya akışı bulunamadı.")
+                }
+                var hasVideo = false
+                for (i in 0 until trackCount) {
+                    val format = extractor.getTrackFormat(i)
+                    val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
+                    if (mime.startsWith("video/")) {
+                        hasVideo = true
+                        break
+                    }
+                }
+                if (!hasVideo) {
+                    return MediaValidationResult.Invalid("Video akışı bulunamadı.")
+                }
+                MediaValidationResult.Valid
+            } catch (e: Exception) {
+                MediaValidationResult.Invalid("Video dosyası açılamadı: ${e.localizedMessage}")
+            } finally {
+                try { extractor.release() } catch (_: Exception) {}
+            }
+        }
+
+        return MediaValidationResult.Valid
+    }
+
+    fun selectVideoFile(fileName: String) {
+        val ti = activeTorrentInfo ?: return
+        val handle = activeHandle ?: return
+        if (!handle.isValid) return
+
+        val fileStorage = ti.files()
+        val numFiles = fileStorage.numFiles()
+        var targetIndex = -1
+        for (i in 0 until numFiles) {
+            val path = fileStorage.filePath(i)
+            if (path == fileName) {
+                targetIndex = i
+                break
+            }
+        }
+        if (targetIndex >= 0) {
+            val priorities = Array(numFiles) { i ->
+                if (i == targetIndex) Priority.fromSwig(4)
+                else if (MediaStorageManager.isVideoFile(fileStorage.filePath(i))) Priority.fromSwig(1)
+                else Priority.IGNORE
+            }
+            try {
+                handle.prioritizeFiles(priorities)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to prioritize files: ${e.localizedMessage}")
+            }
+            _downloadInfo.update { it.copy(selectedVideoFileName = fileName) }
+            Log.i(TAG, "Switched selected video file to: $fileName")
+        }
+    }
+
+    fun pauseDownload() {
+        activeHandle?.pause()
+        _downloadInfo.update { it.copy(state = TorrentState.PAUSED, statusMessage = "Duraklatıldı") }
+    }
+
+    fun resumeDownload(context: Context? = null) {
+        if (context != null) {
+            activeContext = context.applicationContext
+        }
+        activeHandle?.resume()
+        _downloadInfo.update { it.copy(state = TorrentState.DOWNLOADING, statusMessage = "İndiriliyor") }
+        if (downloadMonitorJob == null || downloadMonitorJob?.isActive == false) {
+            startStatusMonitor()
+        }
+    }
+
+    fun cancelDownload() {
+        downloadMonitorJob?.cancel()
+        downloadMonitorJob = null
+        try {
+            activeHandle?.pause()
+        } catch (_: Exception) {}
+        activeHandle = null
+        activeTorrentInfo = null
+        _downloadInfo.value = TorrentDownloadInfo()
+    }
+
+    private fun extractInfoHashFromMagnet(magnetUri: String): String {
+        val pattern = java.util.regex.Pattern.compile("urn:btih:([a-zA-Z0-9]+)")
+        val matcher = pattern.matcher(magnetUri)
+        return if (matcher.find()) matcher.group(1) ?: "" else ""
+    }
+
+    private fun formatSpeed(bytesPerSec: Long): String {
+        if (bytesPerSec <= 0L) return "0 KB/s"
+        val kb = bytesPerSec / 1024.0
+        val mb = kb / 1024.0
+        return when {
+            mb >= 1.0 -> String.format(Locale.US, "%.1f MB/s", mb)
+            else -> String.format(Locale.US, "%.0f KB/s", kb)
+        }
+    }
+
+    private fun formatEta(seconds: Long): String {
+        val h = seconds / 3600
+        val m = (seconds % 3600) / 60
+        val s = seconds % 60
+        return if (h > 0) {
+            String.format(Locale.US, "%02d:%02d:%02d", h, m, s)
+        } else {
+            String.format(Locale.US, "%02d:%02d", m, s)
         }
     }
 
@@ -100,7 +752,7 @@ object TorrentDownloadManager {
     ) {
         val info = _downloadInfo.value
         val uri = info.magnetUri
-        val file = activeTargetFileName.ifBlank { activeOutputFile?.name ?: "" }
+        val file = info.selectedVideoFileName.ifBlank { info.torrentName }
         val metadataReceived = (info.state != TorrentState.RESOLVING_METADATA && info.state != TorrentState.IDLE)
         val torrentId = info.infoHashHex
         val totalSize = info.totalBytes
@@ -111,7 +763,6 @@ object TorrentDownloadManager {
         val completionPct = info.progressPercentage
         val state = stateOverride ?: info.state.name
         val error = errorOverride ?: info.errorMessage
-        val finalPath = activeOutputFile?.absolutePath ?: "Pending"
 
         Log.d(TAG, """
             --- TORRENT STATUS SNAPSHOT ---
@@ -127,882 +778,7 @@ object TorrentDownloadManager {
             COMPLETION %: $completionPct%
             STATE: $state
             ERROR: ${error ?: "None"}
-            FINAL PATH: $finalPath
             -------------------------------
         """.trimIndent())
-
-        if (state == TorrentState.DOWNLOADING.name || state == TorrentState.TRANSFERRING.name) {
-            val pctFloat = info.progress * 100f
-            Log.i(TAG, """
-                [TORRENT]
-                state=$state
-                progress=${String.format(Locale.US, "%.1f%%", pctFloat)}
-                downloadSpeed=$downloadSpeed
-                peers=$peerCount
-                seeds=$seedCount
-            """.trimIndent())
-        } else if (state == TorrentState.COMPLETED.name) {
-            Log.i(TAG, """
-                [TORRENT]
-                state=COMPLETED
-                path=$finalPath
-                size=$totalSize
-            """.trimIndent())
-        }
-    }
-
-    fun startMagnetDownload(context: Context, magnetUri: String) {
-        cancelDownload()
-        isPaused = false
-
-        downloadJob = scope.launch {
-            try {
-                _downloadInfo.value = TorrentDownloadInfo(
-                    magnetUri = magnetUri,
-                    state = TorrentState.RESOLVING_METADATA,
-                    statusMessage = "Magnet bağlantısı çözümleniyor..."
-                )
-                logTorrentSnapshot(stateOverride = TorrentState.RESOLVING_METADATA.name)
-
-                // 1. Parse magnet link
-                val parsed = parseMagnetLink(magnetUri)
-                if (parsed == null) {
-                    val errPair = Pair(TorrentErrorType.INVALID_MAGNET, "Magnet bağlantısı çözümlenemedi. Lütfen geçerli bir 'magnet:?xt=urn:btih:...' linki girin.")
-                    _downloadInfo.update {
-                        it.copy(
-                            state = TorrentState.ERROR,
-                            errorMessage = errPair.second,
-                            errorType = errPair.first
-                        )
-                    }
-                    logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errPair.second)
-                    return@launch
-                }
-
-                _downloadInfo.update {
-                    it.copy(
-                        torrentName = parsed.displayName,
-                        infoHashHex = parsed.infoHashHex,
-                        statusMessage = "İzleyicilere (Trackers) bağlanılıyor...",
-                        state = TorrentState.CONNECTING_TRACKERS
-                    )
-                }
-                logTorrentSnapshot(stateOverride = TorrentState.CONNECTING_TRACKERS.name)
-
-                // 2. Discover peers from trackers
-                val allTrackers = (parsed.trackers + defaultTrackers).distinct()
-                val discoveredPeers = mutableListOf<InetSocketAddress>()
-
-                // Contact trackers concurrently
-                for (trackerUrl in allTrackers.take(6)) {
-                    if (!isActive || isPaused) break
-                    try {
-                        val peers = queryTracker(trackerUrl, parsed.infoHashBytes, 0, 0)
-                        discoveredPeers.addAll(peers.peers)
-                        _downloadInfo.update {
-                            it.copy(
-                                seeders = (it.seeders + peers.seeders).coerceAtLeast(1),
-                                leechers = (it.leechers + peers.leechers).coerceAtLeast(1)
-                            )
-                        }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Tracker query failed ($trackerUrl): ${e.localizedMessage}")
-                    }
-                }
-
-                val uniquePeers = discoveredPeers.distinctBy { "${it.address.hostAddress}:${it.port}" }
-                _downloadInfo.update {
-                    it.copy(
-                        connectedPeers = uniquePeers.size.coerceAtLeast(minOf(uniquePeers.size, 12))
-                    )
-                }
-
-                // 3. Setup temporary download file in app cache & check permissions and space
-                val tempDir = File(context.cacheDir, "torrent_temp").apply { mkdirs() }
-                if (!tempDir.canWrite()) {
-                    val errPair = Pair(TorrentErrorType.PERMISSION, "Önbellek dizinine yazma izni reddedildi.")
-                    _downloadInfo.update { it.copy(state = TorrentState.ERROR, errorMessage = errPair.second, errorType = errPair.first) }
-                    logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errPair.second)
-                    return@launch
-                }
-                if (tempDir.usableSpace < 50L * 1024L * 1024L) {
-                    val errPair = Pair(TorrentErrorType.STORAGE_FULL, "Cihaz depolama alanı yetersiz (50MB'den az boş alan var).")
-                    _downloadInfo.update { it.copy(state = TorrentState.ERROR, errorMessage = errPair.second, errorType = errPair.first) }
-                    logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errPair.second)
-                    return@launch
-                }
-
-                val sanitizedName = TorrentStorageManager.sanitizeFileName(parsed.displayName)
-                val filename = if (TorrentStorageManager.isVideoFile(sanitizedName) || TorrentStorageManager.isTorrentFile(sanitizedName)) {
-                    sanitizedName
-                } else {
-                    "$sanitizedName.mkv"
-                }
-                val outFile = File(tempDir, "temp_dl_${System.currentTimeMillis()}_$filename")
-                activeOutputFile = outFile
-                activeTargetFileName = filename
-                activeContext = context.applicationContext
-
-                // Start speed calculation ticker
-                startSpeedMonitor()
-
-                _downloadInfo.update {
-                    it.copy(
-                        state = TorrentState.DOWNLOADING,
-                        statusMessage = "İndiriliyor",
-                        totalBytes = 250L * 1024L * 1024L // Estimated metadata size
-                    )
-                }
-                logTorrentSnapshot(stateOverride = TorrentState.DOWNLOADING.name)
-
-                // 4. Download content via peer connections
-                executeDownloadLoop(context, outFile, uniquePeers, filename, null)
-
-            } catch (t: Throwable) {
-                Log.e(TAG, "Torrent download error: ${t.localizedMessage}", t)
-                val (errType, errDesc) = classifyError(t)
-                _downloadInfo.update {
-                    it.copy(
-                        state = TorrentState.ERROR,
-                        errorMessage = errDesc,
-                        errorType = errType
-                    )
-                }
-                logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errDesc)
-            }
-        }
-    }
-
-    fun startTorrentFileDownload(context: Context, torrentUri: Uri) {
-        cancelDownload()
-        isPaused = false
-
-        downloadJob = scope.launch {
-            try {
-                _downloadInfo.value = TorrentDownloadInfo(
-                    state = TorrentState.RESOLVING_METADATA,
-                    statusMessage = ".torrent dosyası okunuyor..."
-                )
-                logTorrentSnapshot(stateOverride = TorrentState.RESOLVING_METADATA.name)
-
-                val bytes = context.contentResolver.openInputStream(torrentUri)?.use { it.readBytes() }
-                if (bytes == null || bytes.isEmpty()) {
-                    val errPair = Pair(TorrentErrorType.INVALID_TORRENT, ".torrent dosyası açılamadı veya boş.")
-                    _downloadInfo.update {
-                        it.copy(
-                            state = TorrentState.ERROR,
-                            errorMessage = errPair.second,
-                            errorType = errPair.first
-                        )
-                    }
-                    logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errPair.second)
-                    return@launch
-                }
-
-                val meta = try {
-                    BencodeParser.parseTorrent(bytes)
-                } catch (e: Exception) {
-                    val errPair = Pair(TorrentErrorType.INVALID_TORRENT, "Geçersiz .torrent formatı: ${e.localizedMessage}")
-                    _downloadInfo.update {
-                        it.copy(
-                            state = TorrentState.ERROR,
-                            errorMessage = errPair.second,
-                            errorType = errPair.first
-                        )
-                    }
-                    logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errPair.second)
-                    return@launch
-                }
-
-                val totalLen = if (meta.totalLength > 0) meta.totalLength else 500L * 1024L * 1024L
-                _downloadInfo.update {
-                    it.copy(
-                        torrentName = meta.name,
-                        infoHashHex = meta.infoHashHex,
-                        totalBytes = totalLen,
-                        statusMessage = "İzleyicilere bağlanılıyor...",
-                        state = TorrentState.CONNECTING_TRACKERS
-                    )
-                }
-                logTorrentSnapshot(stateOverride = TorrentState.CONNECTING_TRACKERS.name)
-
-                // Discover peers
-                val allTrackers = (meta.announceList + defaultTrackers).distinct()
-                val discoveredPeers = mutableListOf<InetSocketAddress>()
-
-                for (tracker in allTrackers.take(5)) {
-                    if (!isActive || isPaused) break
-                    try {
-                        val peers = queryTracker(tracker, meta.infoHash, 0, totalLen)
-                        discoveredPeers.addAll(peers.peers)
-                        _downloadInfo.update {
-                            it.copy(
-                                seeders = (it.seeders + peers.seeders).coerceAtLeast(1),
-                                leechers = (it.leechers + peers.leechers).coerceAtLeast(1)
-                            )
-                        }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Tracker error ($tracker): ${e.localizedMessage}")
-                    }
-                }
-
-                val uniquePeers = discoveredPeers.distinctBy { "${it.address.hostAddress}:${it.port}" }
-                _downloadInfo.update {
-                    it.copy(
-                        connectedPeers = uniquePeers.size.coerceAtLeast(minOf(uniquePeers.size, 15))
-                    )
-                }
-
-                // Output file in app cache & check permissions and space
-                val tempDir = File(context.cacheDir, "torrent_temp").apply { mkdirs() }
-                if (!tempDir.canWrite()) {
-                    val errPair = Pair(TorrentErrorType.PERMISSION, "Önbellek dizinine yazma izni reddedildi.")
-                    _downloadInfo.update { it.copy(state = TorrentState.ERROR, errorMessage = errPair.second, errorType = errPair.first) }
-                    logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errPair.second)
-                    return@launch
-                }
-                if (tempDir.usableSpace < 50L * 1024L * 1024L) {
-                    val errPair = Pair(TorrentErrorType.STORAGE_FULL, "Cihaz depolama alanı yetersiz (50MB'den az boş alan var).")
-                    _downloadInfo.update { it.copy(state = TorrentState.ERROR, errorMessage = errPair.second, errorType = errPair.first) }
-                    logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errPair.second)
-                    return@launch
-                }
-
-                val safeName = TorrentStorageManager.sanitizeFileName(meta.name)
-                val filename = if (TorrentStorageManager.isVideoFile(safeName)) {
-                    safeName
-                } else if (safeName.endsWith(".torrent", ignoreCase = true)) {
-                    safeName
-                } else {
-                    "$safeName.mkv"
-                }
-                val outFile = File(tempDir, "temp_dl_${System.currentTimeMillis()}_$filename")
-                activeOutputFile = outFile
-                activeTargetFileName = filename
-                activeContext = context.applicationContext
-
-                startSpeedMonitor()
-
-                _downloadInfo.update {
-                    it.copy(
-                        state = TorrentState.DOWNLOADING,
-                        statusMessage = "İndiriliyor"
-                    )
-                }
-                logTorrentSnapshot(stateOverride = TorrentState.DOWNLOADING.name)
-
-                executeDownloadLoop(context, outFile, uniquePeers, filename, bytes)
-
-            } catch (t: Throwable) {
-                Log.e(TAG, "Torrent file download error: ${t.localizedMessage}", t)
-                val (errType, errDesc) = classifyError(t)
-                _downloadInfo.update {
-                    it.copy(
-                        state = TorrentState.ERROR,
-                        errorMessage = errDesc,
-                        errorType = errType
-                    )
-                }
-                logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errDesc)
-            }
-        }
-    }
-
-    private suspend fun executeDownloadLoop(
-        context: Context,
-        outFile: File,
-        peers: List<InetSocketAddress>,
-        targetFileName: String,
-        rawPayload: ByteArray? = null
-    ) {
-        val isVideo = TorrentStorageManager.isVideoFile(targetFileName)
-
-        // If file has raw bytes (e.g. .torrent file content), write them directly
-        if (rawPayload != null && rawPayload.isNotEmpty() && !isVideo) {
-            outFile.writeBytes(rawPayload)
-        } else if (isVideo && (!outFile.exists() || outFile.length() <= 0L)) {
-            // For video torrents: Initialize with valid media container structure
-            // so that the resulting MKV/video is valid, playable, and has valid media streams
-            initializeValidMediaFile(context, outFile)
-        } else if (!outFile.exists()) {
-            outFile.createNewFile()
-        }
-
-        val initialSize = outFile.length()
-        val total = _downloadInfo.value.totalBytes.coerceAtLeast(initialSize).coerceAtLeast(30L * 1024L * 1024L)
-        var downloaded = minOf(initialSize, total / 3).coerceAtLeast(1024L)
-
-        try {
-            while (downloaded < total && !isPaused && scope.isActive) {
-                val chunkSize = (512 * 1024).toLong() // 512 KB chunks
-                val remaining = total - downloaded
-                val currentChunk = minOf(chunkSize, remaining)
-
-                downloaded += currentChunk
-                recordDownloadedBytes(currentChunk)
-
-                val progress = (downloaded.toFloat() / total.toFloat()).coerceIn(0f, 1f)
-                val percentage = (progress * 100).toInt()
-
-                _downloadInfo.update {
-                    it.copy(
-                        downloadedBytes = downloaded,
-                        progress = progress,
-                        progressPercentage = percentage,
-                        statusMessage = "İndiriliyor"
-                    )
-                }
-
-                delay(80) // Network pacing
-            }
-
-            if (downloaded >= total && !isPaused) {
-                stopSpeedMonitor()
-
-                // --- CRITICAL STEP: MKV / Media Container Validation BEFORE publishing! ---
-                _downloadInfo.update {
-                    it.copy(
-                        state = TorrentState.TRANSFERRING,
-                        statusMessage = "İndirilen dosya doğrulanıyor...",
-                        speedText = "Doğrulanıyor",
-                        etaText = "--:--"
-                    )
-                }
-
-                val mediaValidation = validateDownloadedMedia(outFile, isVideo)
-                if (mediaValidation is MediaValidationResult.Invalid) {
-                    Log.e(TAG, "İndirilen medya doğrulama hatası: ${mediaValidation.reason}")
-                    try { if (outFile.exists()) outFile.delete() } catch (_: Exception) {}
-                    _downloadInfo.update {
-                        it.copy(
-                            state = TorrentState.ERROR,
-                            errorMessage = "İndirilen MKV dosyası doğrulanamadı veya dosya bozuk: ${mediaValidation.reason}",
-                            statusMessage = "Hata"
-                        )
-                    }
-                    return
-                }
-
-                // Transfer completed temporary file to permanent user storage and verify
-                _downloadInfo.update {
-                    it.copy(
-                        state = TorrentState.TRANSFERRING,
-                        statusMessage = "Cihaz depolamasına aktarılıyor (%0)...",
-                        speedText = "Depolamaya yazılıyor",
-                        etaText = "--:--"
-                    )
-                }
-
-                val saveResult = TorrentStorageManager.saveToUserAccessibleStorage(
-                    context = context,
-                    tempFile = outFile,
-                    originalFileName = targetFileName
-                ) { progress, written, totalBytes ->
-                    val pct = (progress * 100).toInt()
-                    _downloadInfo.update {
-                        it.copy(
-                            state = TorrentState.TRANSFERRING,
-                            statusMessage = "Cihaz depolamasına aktarılıyor (%$pct)...",
-                            progress = progress,
-                            progressPercentage = pct,
-                            speedText = "Depolamaya yazılıyor",
-                            etaText = "--:--"
-                        )
-                    }
-                }
-
-                when (saveResult) {
-                    is StorageSaveResult.Success -> {
-                        activeOutputFile = saveResult.permanentFile
-                        _downloadInfo.update {
-                            it.copy(
-                                state = TorrentState.COMPLETED,
-                                statusMessage = "İndirme tamamlandı",
-                                progress = 1f,
-                                progressPercentage = 100,
-                                speedText = "0 KB/s",
-                                etaText = "00:00",
-                                downloadedFile = saveResult.permanentFile,
-                                permanentUri = saveResult.permanentUri,
-                                errorMessage = null,
-                                errorType = null
-                            )
-                        }
-                        logTorrentSnapshot(stateOverride = TorrentState.COMPLETED.name)
-                    }
-                    is StorageSaveResult.Failure -> {
-                        Log.e(TAG, "Kalıcı depolamaya aktarma hatası: ${saveResult.reason}")
-                        val (errType, errDesc) = classifyError(IllegalStateException(saveResult.reason))
-                        _downloadInfo.update {
-                            it.copy(
-                                state = TorrentState.ERROR,
-                                errorMessage = errDesc,
-                                errorType = errType,
-                                statusMessage = "Hata"
-                            )
-                        }
-                        logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errDesc)
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            if (!isPaused) {
-                Log.w(TAG, "Download loop interrupted: ${e.localizedMessage}")
-                val (errType, errDesc) = classifyError(e)
-                _downloadInfo.update {
-                    it.copy(
-                        state = TorrentState.ERROR,
-                        errorMessage = errDesc,
-                        errorType = errType,
-                        statusMessage = "Hata"
-                    )
-                }
-                logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errDesc)
-            }
-        }
-    }
-
-    private fun initializeValidMediaFile(context: Context, destFile: File) {
-        try {
-            context.resources.openRawResource(com.example.R.raw.sample_demo).use { input ->
-                java.io.FileOutputStream(destFile).use { output ->
-                    input.copyTo(output)
-                    output.flush()
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Could not initialize template media: ${e.localizedMessage}")
-            destFile.createNewFile()
-        }
-    }
-
-    private sealed class MediaValidationResult {
-        object Valid : MediaValidationResult()
-        data class Invalid(val reason: String) : MediaValidationResult()
-    }
-
-    private fun validateDownloadedMedia(file: File, isVideo: Boolean): MediaValidationResult {
-        if (!file.exists() || !file.canRead() || file.length() <= 0L) {
-            return MediaValidationResult.Invalid("Dosya bulunamadı veya boş.")
-        }
-
-        if (isVideo) {
-            val extractor = MediaExtractor()
-            return try {
-                extractor.setDataSource(file.absolutePath)
-                val trackCount = extractor.trackCount
-                if (trackCount <= 0) {
-                    return MediaValidationResult.Invalid("Dosyada geçerli medya akışı bulunamadı.")
-                }
-                var hasVideo = false
-                for (i in 0 until trackCount) {
-                    val format = extractor.getTrackFormat(i)
-                    val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
-                    if (mime.startsWith("video/")) {
-                        hasVideo = true
-                        break
-                    }
-                }
-                if (!hasVideo) {
-                    return MediaValidationResult.Invalid("MKV dosyasında video akışı bulunamadı.")
-                }
-                MediaValidationResult.Valid
-            } catch (e: Exception) {
-                MediaValidationResult.Invalid("MKV kapsayıcısı açılamadı: ${e.localizedMessage}")
-            } finally {
-                try { extractor.release() } catch (_: Exception) {}
-            }
-        } else {
-            return if (file.length() >= 10L) {
-                MediaValidationResult.Valid
-            } else {
-                MediaValidationResult.Invalid("Torrent dosyası geçersiz.")
-            }
-        }
-    }
-
-    private fun stopSpeedMonitor() {
-        speedMonitorJob?.cancel()
-        speedMonitorJob = null
-    }
-
-    private fun startSpeedMonitor() {
-        speedMonitorJob?.cancel()
-        speedMonitorJob = scope.launch {
-            while (isActive) {
-                delay(1000)
-                val now = System.currentTimeMillis()
-                val windowMs = 3000L
-
-                synchronized(speedHistory) {
-                    // Remove records older than 3 seconds
-                    while (speedHistory.isNotEmpty() && (now - speedHistory.peek().first) > windowMs) {
-                        speedHistory.poll()
-                    }
-
-                    var bytesSum = 0L
-                    for (entry in speedHistory) {
-                        bytesSum += entry.second
-                    }
-
-                    val speedPerSec = (bytesSum / (windowMs / 1000.0)).toLong()
-                    val speedText = formatSpeed(speedPerSec)
-
-                    val remainingBytes = (_downloadInfo.value.totalBytes - _downloadInfo.value.downloadedBytes).coerceAtLeast(0L)
-                    val etaText = if (speedPerSec > 1024) {
-                        val etaSeconds = remainingBytes / speedPerSec
-                        formatEta(etaSeconds)
-                    } else {
-                        "Kalan süre hesaplanıyor..."
-                    }
-
-                    if (_downloadInfo.value.state == TorrentState.DOWNLOADING) {
-                        _downloadInfo.update {
-                            it.copy(
-                                speedBytesPerSec = speedPerSec,
-                                speedText = speedText,
-                                etaText = etaText
-                            )
-                        }
-                        logTorrentSnapshot(stateOverride = TorrentState.DOWNLOADING.name)
-                    }
-                }
-            }
-        }
-    }
-
-    private fun recordDownloadedBytes(bytes: Long) {
-        synchronized(speedHistory) {
-            speedHistory.add(Pair(System.currentTimeMillis(), bytes))
-        }
-    }
-
-    fun pauseDownload() {
-        isPaused = true
-        downloadJob?.cancel()
-        _downloadInfo.update {
-            it.copy(
-                state = TorrentState.PAUSED,
-                statusMessage = "Duraklatıldı",
-                speedText = "0 KB/s"
-            )
-        }
-    }
-
-    fun resumeDownload(context: Context) {
-        if (_downloadInfo.value.state == TorrentState.PAUSED) {
-            isPaused = false
-            val currentInfo = _downloadInfo.value
-            if (currentInfo.magnetUri.isNotEmpty()) {
-                startMagnetDownload(context, currentInfo.magnetUri)
-            } else if (activeOutputFile != null) {
-                activeContext = context.applicationContext
-                val targetName = activeTargetFileName.ifBlank { activeOutputFile!!.name }
-                downloadJob = scope.launch {
-                    startSpeedMonitor()
-                    _downloadInfo.update {
-                        it.copy(state = TorrentState.DOWNLOADING, statusMessage = "İndiriliyor")
-                    }
-                    executeDownloadLoop(context, activeOutputFile!!, emptyList(), targetName)
-                }
-            }
-        }
-    }
-
-    fun cancelDownload() {
-        isPaused = false
-        downloadJob?.cancel()
-        downloadJob = null
-        stopSpeedMonitor()
-        synchronized(speedHistory) { speedHistory.clear() }
-        activeOutputFile?.let { f ->
-            if (f.exists() && f.parentFile?.name == "torrent_temp") {
-                try { f.delete() } catch (_: Exception) {}
-            }
-        }
-        _downloadInfo.value = TorrentDownloadInfo()
-    }
-
-    // Helper: Tracker response structure
-    data class TrackerResult(
-        val seeders: Int,
-        val leechers: Int,
-        val peers: List<InetSocketAddress>
-    )
-
-    private suspend fun queryTracker(
-        trackerUrl: String,
-        infoHash: ByteArray,
-        downloaded: Long,
-        left: Long
-    ): TrackerResult = withContext(Dispatchers.IO) {
-        if (trackerUrl.startsWith("http://") || trackerUrl.startsWith("https://")) {
-            return@withContext queryHttpTracker(trackerUrl, infoHash, downloaded, left)
-        } else if (trackerUrl.startsWith("udp://")) {
-            return@withContext queryUdpTracker(trackerUrl, infoHash, downloaded, left)
-        }
-        TrackerResult(seeders = 12, leechers = 4, peers = emptyList())
-    }
-
-    private fun queryHttpTracker(
-        urlStr: String,
-        infoHash: ByteArray,
-        downloaded: Long,
-        left: Long
-    ): TrackerResult {
-        val encodedHash = byteArrayToUrlEncoded(infoHash)
-        val separator = if (urlStr.contains("?")) "&" else "?"
-        val fullUrl = "$urlStr${separator}info_hash=$encodedHash&peer_id=$peerId&port=6881&uploaded=0&downloaded=$downloaded&left=$left&compact=1&event=started"
-
-        val request = Request.Builder().url(fullUrl).build()
-        val response = httpClient.newCall(request).execute()
-        val bodyBytes = response.body?.bytes() ?: return TrackerResult(8, 2, emptyList())
-
-        return try {
-            val root = BencodeParser.parse(bodyBytes) as? BencodeParser.BValue.BDict
-            val seeders = (root?.map?.get("complete") as? BencodeParser.BValue.BInt)?.value?.toInt() ?: 16
-            val leechers = (root?.map?.get("incomplete") as? BencodeParser.BValue.BInt)?.value?.toInt() ?: 5
-            val peerList = mutableListOf<InetSocketAddress>()
-
-            val peersVal = root?.map?.get("peers")
-            if (peersVal is BencodeParser.BValue.BString) {
-                val bytes = peersVal.bytes
-                for (i in 0 until bytes.size step 6) {
-                    if (i + 6 <= bytes.size) {
-                        val ip = "${bytes[i].toInt() and 0xFF}.${bytes[i+1].toInt() and 0xFF}.${bytes[i+2].toInt() and 0xFF}.${bytes[i+3].toInt() and 0xFF}"
-                        val port = ((bytes[i+4].toInt() and 0xFF) shl 8) or (bytes[i+5].toInt() and 0xFF)
-                        try {
-                            peerList.add(InetSocketAddress(InetAddress.getByName(ip), port))
-                        } catch (_: Exception) {}
-                    }
-                }
-            }
-            TrackerResult(seeders, leechers, peerList)
-        } catch (e: Exception) {
-            TrackerResult(14, 4, emptyList())
-        }
-    }
-
-    private fun queryUdpTracker(
-        trackerUrl: String,
-        infoHash: ByteArray,
-        downloaded: Long,
-        left: Long
-    ): TrackerResult {
-        // UDP Tracker protocol (BEP 15)
-        try {
-            val uri = java.net.URI(trackerUrl)
-            val host = uri.host ?: return TrackerResult(18, 6, emptyList())
-            val port = if (uri.port > 0) uri.port else 1337
-
-            val socket = DatagramSocket().apply { soTimeout = 3000 }
-            val address = InetAddress.getByName(host)
-
-            // Step 1: Connect Request
-            val connectBuffer = ByteBuffer.allocate(16)
-            connectBuffer.putLong(0x41727101980L) // protocol_id
-            connectBuffer.putInt(0) // action = 0 (connect)
-            val transactionId = (Math.random() * Int.MAX_VALUE).toInt()
-            connectBuffer.putInt(transactionId)
-
-            val sendPacket = DatagramPacket(connectBuffer.array(), 16, address, port)
-            socket.send(sendPacket)
-
-            // Receive Connection response
-            val recvBuffer = ByteArray(16)
-            val recvPacket = DatagramPacket(recvBuffer, 16)
-            socket.receive(recvPacket)
-
-            val respBuffer = ByteBuffer.wrap(recvBuffer)
-            val action = respBuffer.getInt()
-            val respTransId = respBuffer.getInt()
-            if (action != 0 || respTransId != transactionId) {
-                socket.close()
-                return TrackerResult(22, 7, emptyList())
-            }
-            val connectionId = respBuffer.getLong()
-
-            // Step 2: Announce Request
-            val announceBuf = ByteBuffer.allocate(98)
-            announceBuf.putLong(connectionId)
-            announceBuf.putInt(1) // action = 1 (announce)
-            val announceTransId = (Math.random() * Int.MAX_VALUE).toInt()
-            announceBuf.putInt(announceTransId)
-            announceBuf.put(infoHash)
-            announceBuf.put(peerId.toByteArray(StandardCharsets.ISO_8859_1).copyOf(20))
-            announceBuf.putLong(downloaded)
-            announceBuf.putLong(left)
-            announceBuf.putLong(0L) // uploaded
-            announceBuf.putInt(2) // event = started
-            announceBuf.putInt(0) // IP default
-            announceBuf.putInt(0) // key
-            announceBuf.putInt(50) // num_want
-            announceBuf.putShort(6881.toShort())
-
-            val annPacket = DatagramPacket(announceBuf.array(), 98, address, port)
-            socket.send(annPacket)
-
-            val annRecvBuf = ByteArray(1024)
-            val annRecvPacket = DatagramPacket(annRecvBuf, 1024)
-            socket.receive(annRecvPacket)
-
-            val annResp = ByteBuffer.wrap(annRecvBuf)
-            val annAction = annResp.getInt()
-            val annTransId = annResp.getInt()
-            if (annAction != 1 || annTransId != announceTransId) {
-                socket.close()
-                return TrackerResult(20, 8, emptyList())
-            }
-
-            val interval = annResp.getInt()
-            val leechers = annResp.getInt()
-            val seeders = annResp.getInt()
-
-            val peers = mutableListOf<InetSocketAddress>()
-            val remainingBytes = annRecvPacket.length - 20
-            val peerCount = remainingBytes / 6
-            for (i in 0 until peerCount) {
-                val ipBytes = ByteArray(4)
-                annResp.get(ipBytes)
-                val peerPort = annResp.getShort().toInt() and 0xFFFF
-                val ip = "${ipBytes[0].toInt() and 0xFF}.${ipBytes[1].toInt() and 0xFF}.${ipBytes[2].toInt() and 0xFF}.${ipBytes[3].toInt() and 0xFF}"
-                try {
-                    peers.add(InetSocketAddress(InetAddress.getByName(ip), peerPort))
-                } catch (_: Exception) {}
-            }
-
-            socket.close()
-            return TrackerResult(seeders.coerceAtLeast(1), leechers.coerceAtLeast(1), peers)
-        } catch (e: Exception) {
-            return TrackerResult(24, 8, emptyList())
-        }
-    }
-
-    private data class ParsedMagnet(
-        val infoHashHex: String,
-        val infoHashBytes: ByteArray,
-        val displayName: String,
-        val trackers: List<String>
-    )
-
-    private fun parseMagnetLink(uriStr: String): ParsedMagnet? {
-        if (!uriStr.startsWith("magnet:?")) return null
-        val params = uriStr.removePrefix("magnet:?").split("&")
-        var xt: String? = null
-        var dn: String = "Torrent İndirmesi"
-        val trList = mutableListOf<String>()
-
-        for (p in params) {
-            val parts = p.split("=", limit = 2)
-            if (parts.size == 2) {
-                val key = parts[0]
-                val value = URLDecoder.decode(parts[1], "UTF-8")
-                when (key) {
-                    "xt" -> xt = value
-                    "dn" -> dn = value
-                    "tr" -> trList.add(value)
-                }
-            }
-        }
-
-        if (xt == null) return null
-        val btih = when {
-            xt.startsWith("urn:btih:") -> xt.removePrefix("urn:btih:")
-            xt.startsWith("urn:btmh:") -> xt.removePrefix("urn:btmh:")
-            else -> return null
-        }
-
-        // BTIH can be 40 chars hex or 32 chars base32
-        val hexHash: String
-        val hashBytes: ByteArray
-
-        if (btih.length == 40 && btih.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }) {
-            hexHash = btih.lowercase(Locale.US)
-            hashBytes = hexStringToByteArray(hexHash)
-        } else if (btih.length == 32) {
-            hashBytes = base32Decode(btih)
-            hexHash = hashBytes.joinToString("") { "%02x".format(it) }
-        } else {
-            return null
-        }
-
-        return ParsedMagnet(
-            infoHashHex = hexHash,
-            infoHashBytes = hashBytes,
-            displayName = dn,
-            trackers = trList
-        )
-    }
-
-    private fun hexStringToByteArray(s: String): ByteArray {
-        val len = s.length
-        val data = ByteArray(len / 2)
-        var i = 0
-        while (i < len) {
-            data[i / 2] = ((Character.digit(s[i], 16) shl 4) + Character.digit(s[i + 1], 16)).toByte()
-            i += 2
-        }
-        return data
-    }
-
-    private fun base32Decode(base32: String): ByteArray {
-        val base32Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
-        var buffer = 0
-        var bitsLeft = 0
-        val out = mutableListOf<Byte>()
-        for (c in base32.uppercase(Locale.US)) {
-            val valIndex = base32Chars.indexOf(c)
-            if (valIndex < 0) continue
-            buffer = (buffer shl 5) or valIndex
-            bitsLeft += 5
-            if (bitsLeft >= 8) {
-                out.add(((buffer shr (bitsLeft - 8)) and 0xFF).toByte())
-                bitsLeft -= 8
-            }
-        }
-        return out.toByteArray()
-    }
-
-    private fun byteArrayToUrlEncoded(bytes: ByteArray): String {
-        val sb = StringBuilder()
-        for (b in bytes) {
-            val ch = b.toInt() and 0xFF
-            if ((ch in 'a'.code..'z'.code) || (ch in 'A'.code..'Z'.code) || (ch in '0'.code..'9'.code) ||
-                ch == '-'.code || ch == '_'.code || ch == '.'.code || ch == '~'.code) {
-                sb.append(ch.toChar())
-            } else {
-                sb.append("%").append(String.format(Locale.US, "%02X", ch))
-            }
-        }
-        return sb.toString()
-    }
-
-    private fun generatePeerId(): String {
-        val prefix = "-RS0100-" // RemSubs 0.1.0.0
-        val randomChars = (1..12).map { ('a'..'z').random() }.joinToString("")
-        return prefix + randomChars
-    }
-
-    private fun formatSpeed(bytesPerSec: Long): String {
-        if (bytesPerSec <= 0L) return "0 KB/s"
-        val kb = bytesPerSec / 1024.0
-        val mb = kb / 1024.0
-        return if (mb >= 1.0) {
-            String.format(Locale.US, "%.1f MB/s", mb)
-        } else {
-            String.format(Locale.US, "%.0f KB/s", kb)
-        }
-    }
-
-    private fun formatEta(seconds: Long): String {
-        if (seconds <= 0L) return "00:00"
-        val mins = seconds / 60
-        val secs = seconds % 60
-        val hours = mins / 60
-        return if (hours > 0) {
-            String.format(Locale.US, "%02d:%02d:%02d", hours, mins % 60, secs)
-        } else {
-            String.format(Locale.US, "%02d:%02d", mins, secs)
-        }
     }
 }

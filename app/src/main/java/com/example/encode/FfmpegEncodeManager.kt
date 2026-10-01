@@ -110,13 +110,17 @@ object FfmpegEncodeManager {
         customFontFile: File? = null,
         additionalStyles: List<String> = emptyList(),
         settings: EncodingSettings = EncodingSettings(),
-        sourceMetadata: SourceVideoMetadata = SourceVideoMetadata()
+        sourceMetadata: SourceVideoMetadata = SourceVideoMetadata(),
+        introVideoUri: Uri? = null,
+        introDurationMs: Long = 0L,
+        introKeepAudio: Boolean = false
     ) = withContext(Dispatchers.IO) {
         val startTimeMs = System.currentTimeMillis()
         isCancelledByUser = false
         fullLogBuffer.clear()
 
         var tempInputVideo: File? = null
+        var tempIntroVideo: File? = null
         var tempAssFile: File? = null
         var tempOutputFile: File? = null
 
@@ -155,9 +159,29 @@ object FfmpegEncodeManager {
 
             if (isCancelledByUser) return@withContext
 
+            // Process optional intro video
+            var effectiveIntroDurMs = 0L
+            if (introVideoUri != null) {
+                _encodeState.update { it.copy(currentPhaseText = "İntro videosu hazırlanıyor...") }
+                val introFile = File(cacheWorkingDir, "intro_${System.currentTimeMillis()}.mp4")
+                copyUriToFileStreaming(context, introVideoUri, introFile)
+
+                if (introFile.exists() && introFile.length() > 0L) {
+                    tempIntroVideo = introFile
+                    val (detectedIntroDur, _) = extractVideoDurationAndFps(context, introFile)
+                    effectiveIntroDurMs = if (introDurationMs > 0) introDurationMs else detectedIntroDur
+                    Log.i(TAG, "Intro video prepared: ${introFile.name} ($effectiveIntroDurMs ms, keepAudio: $introKeepAudio)")
+                } else {
+                    Log.w(TAG, "Intro video could not be read or is empty, continuing without intro.")
+                }
+            }
+
+            if (isCancelledByUser) return@withContext
+
             // Calculate video duration and FPS for progress tracking
             val (durationMs, videoFps) = extractVideoDurationAndFps(context, inputVideoFile)
-            activeTotalDurationMs = if (durationMs > 0) durationMs else sourceMetadata.durationMs
+            val mainDurationMs = if (durationMs > 0) durationMs else sourceMetadata.durationMs
+            activeTotalDurationMs = mainDurationMs + effectiveIntroDurMs
             val effectiveFps = if (videoFps > 0) videoFps else sourceMetadata.fps.coerceAtLeast(24.0)
             activeTotalFrames = if (activeTotalDurationMs > 0) {
                 ((activeTotalDurationMs / 1000.0) * effectiveFps).toLong().coerceAtLeast(1L)
@@ -177,6 +201,7 @@ object FfmpegEncodeManager {
 
             val videoWidth = if (sourceMetadata.width > 0) sourceMetadata.width else 1920
             val videoHeight = if (sourceMetadata.height > 0) sourceMetadata.height else 1080
+            // Subtitle timing shifted by intro duration so subtitles start when main video starts
             val assContent = AssGenerator.generateAss(
                 title = "remsubs_hardsub",
                 subtitles = cues,
@@ -184,7 +209,8 @@ object FfmpegEncodeManager {
                 applyTimeOffset = false,
                 videoWidth = videoWidth,
                 videoHeight = videoHeight,
-                additionalStyles = additionalStyles
+                additionalStyles = additionalStyles,
+                introOffsetMs = effectiveIntroDurMs
             )
 
             // Extract all font names referenced across styles, cues, and settings
@@ -237,15 +263,51 @@ object FfmpegEncodeManager {
                 "360p" -> 360
                 else -> 0
             }
+            val scaleOption = if (targetHeight > 0) ",scale=-2:$targetHeight" else ""
             if (targetHeight > 0) {
-                vfArg += ",scale=-2:$targetHeight"
+                vfArg += scaleOption
+            }
+
+            var filterComplexArg: String? = null
+            var hasMappedAudio = false
+            if (tempIntroVideo != null) {
+                val targetW = if (sourceMetadata.width > 0) sourceMetadata.width else 1920
+                val targetH = if (sourceMetadata.height > 0) sourceMetadata.height else 1080
+                val fpsStr = String.format(Locale.US, "%.2f", effectiveFps)
+
+                val scaleIntro = "[0:v]scale=$targetW:$targetH:force_original_aspect_ratio=decrease,pad=$targetW:$targetH:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=$fpsStr[v0];"
+                val scaleMain = "[1:v]scale=$targetW:$targetH,setsar=1,fps=$fpsStr[v1];"
+                val concatV = "[v0][v1]concat=n=2:v=1:a=0[vcat];"
+                val assPart = "[vcat]ass='${escapedAssPath}':fontsdir='${escapedFontsDirPath}'$scaleOption[vfinal]"
+
+                val mainHasAudio = hasAudioTrack(inputVideoFile)
+                val introHasAudio = hasAudioTrack(tempIntroVideo)
+
+                val audioFilterPart: String
+                if (settings.audioOption.startsWith("Sessiz", ignoreCase = true)) {
+                    audioFilterPart = ""
+                    hasMappedAudio = false
+                } else if (mainHasAudio) {
+                    hasMappedAudio = true
+                    if (introKeepAudio && introHasAudio) {
+                        audioFilterPart = ";[0:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a0];[1:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a1];[a0][a1]concat=n=2:v=0:a=1[afinal]"
+                    } else {
+                        val introSecStr = String.format(Locale.US, "%.3f", (effectiveIntroDurMs / 1000.0).coerceAtLeast(0.1))
+                        audioFilterPart = ";anullsrc=channel_layout=stereo:sample_rate=44100,atrim=end=$introSecStr[a0];[1:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a1];[a0][a1]concat=n=2:v=0:a=1[afinal]"
+                    }
+                } else {
+                    hasMappedAudio = false
+                    audioFilterPart = ""
+                }
+
+                filterComplexArg = "$scaleIntro$scaleMain$concatV$assPart$audioFilterPart"
             }
 
             val crf = settings.crf.coerceIn(14, 28)
             val preset = settings.preset.ifBlank { "veryfast" }
 
             val wantsOriginalAudio = settings.audioOption.startsWith("Orijinal", ignoreCase = true)
-            val isAudioCopyable = wantsOriginalAudio && isCodecMp4Compatible(sourceMetadata.audioCodec)
+            val isAudioCopyable = wantsOriginalAudio && isCodecMp4Compatible(sourceMetadata.audioCodec) && tempIntroVideo == null
 
             var encodeSession = executeFfmpegSession(
                 inputVideoFile = inputVideoFile,
@@ -258,7 +320,10 @@ object FfmpegEncodeManager {
                 copyAudio = isAudioCopyable,
                 totalFrames = activeTotalFrames,
                 totalDurationMs = activeTotalDurationMs,
-                startTimeMs = startTimeMs
+                startTimeMs = startTimeMs,
+                introVideoFile = tempIntroVideo,
+                filterComplexArg = filterComplexArg,
+                hasMappedAudio = hasMappedAudio
             )
 
             var effectiveEncoderName = videoEncoderName
@@ -285,7 +350,10 @@ object FfmpegEncodeManager {
                     copyAudio = isAudioCopyable,
                     totalFrames = activeTotalFrames,
                     totalDurationMs = activeTotalDurationMs,
-                    startTimeMs = startTimeMs
+                    startTimeMs = startTimeMs,
+                    introVideoFile = tempIntroVideo,
+                    filterComplexArg = filterComplexArg,
+                    hasMappedAudio = hasMappedAudio
                 )
             }
 
@@ -310,7 +378,10 @@ object FfmpegEncodeManager {
                         copyAudio = false, // Force AAC
                         totalFrames = activeTotalFrames,
                         totalDurationMs = activeTotalDurationMs,
-                        startTimeMs = startTimeMs
+                        startTimeMs = startTimeMs,
+                        introVideoFile = tempIntroVideo,
+                        filterComplexArg = filterComplexArg,
+                        hasMappedAudio = hasMappedAudio
                     )
                 }
             }
@@ -327,7 +398,7 @@ object FfmpegEncodeManager {
                         errorMessage = "Encode kullanıcı tarafından iptal edildi."
                     )
                 }
-                cleanupFiles(tempInputVideo, tempAssFile, tempOutputFile)
+                cleanupFiles(tempInputVideo, tempIntroVideo, tempAssFile, tempOutputFile)
                 return@withContext
             }
 
@@ -344,7 +415,7 @@ object FfmpegEncodeManager {
                         fullLogs = allLogs.takeLast(8000)
                     )
                 }
-                cleanupFiles(tempInputVideo, tempAssFile, tempOutputFile)
+                cleanupFiles(tempInputVideo, tempIntroVideo, tempAssFile, tempOutputFile)
                 return@withContext
             }
 
@@ -370,7 +441,7 @@ object FfmpegEncodeManager {
                         fullLogs = allLogs.takeLast(8000)
                     )
                 }
-                cleanupFiles(tempInputVideo, tempAssFile, tempOutputFile)
+                cleanupFiles(tempInputVideo, tempIntroVideo, tempAssFile, tempOutputFile)
                 return@withContext
             }
 
@@ -388,12 +459,12 @@ object FfmpegEncodeManager {
                         currentPhaseText = "Hata"
                     )
                 }
-                cleanupFiles(tempInputVideo, tempAssFile, tempOutputFile)
+                cleanupFiles(tempInputVideo, tempIntroVideo, tempAssFile, tempOutputFile)
                 return@withContext
             }
 
             // Success! Clean up temporary files
-            cleanupFiles(tempInputVideo, tempAssFile, tempOutputFile)
+            cleanupFiles(tempInputVideo, tempIntroVideo, tempAssFile, tempOutputFile)
 
             val elapsedSec = (System.currentTimeMillis() - startTimeMs) / 1000
             Log.i(TAG, "Hardsub encode completed successfully: ${permanentFile.absolutePath} ($elapsedSec s)")
@@ -415,7 +486,7 @@ object FfmpegEncodeManager {
 
         } catch (t: Throwable) {
             Log.e(TAG, "Fatal error in internal FFmpeg hardsub encode: ${t.localizedMessage}", t)
-            cleanupFiles(tempInputVideo, tempAssFile, tempOutputFile)
+            cleanupFiles(tempInputVideo, tempIntroVideo, tempAssFile, tempOutputFile)
             _encodeState.update {
                 it.copy(
                     isPreparing = false,
@@ -437,18 +508,36 @@ object FfmpegEncodeManager {
         copyAudio: Boolean,
         totalFrames: Long,
         totalDurationMs: Long,
-        startTimeMs: Long
+        startTimeMs: Long,
+        introVideoFile: File? = null,
+        filterComplexArg: String? = null,
+        hasMappedAudio: Boolean = false
     ): FFmpegSession {
         val args = mutableListOf<String>()
         args.add("-y")
-        args.add("-i")
-        args.add(inputVideoFile.absolutePath)
-        args.add("-vf")
-        args.add(vfArg)
-        args.add("-map")
-        args.add("0:v:0")
-        args.add("-map")
-        args.add("0:a?")
+        if (filterComplexArg != null && introVideoFile != null) {
+            args.add("-i")
+            args.add(introVideoFile.absolutePath)
+            args.add("-i")
+            args.add(inputVideoFile.absolutePath)
+            args.add("-filter_complex")
+            args.add(filterComplexArg)
+            args.add("-map")
+            args.add("[vfinal]")
+            if (hasMappedAudio) {
+                args.add("-map")
+                args.add("[afinal]")
+            }
+        } else {
+            args.add("-i")
+            args.add(inputVideoFile.absolutePath)
+            args.add("-vf")
+            args.add(vfArg)
+            args.add("-map")
+            args.add("0:v:0")
+            args.add("-map")
+            args.add("0:a?")
+        }
         args.add("-c:v")
         args.add(videoEncoderName)
 
@@ -490,37 +579,52 @@ object FfmpegEncodeManager {
 
         // Audio stream processing based on settings
         val audioOpt = settings.audioOption
-        when {
-            audioOpt.startsWith("Sessiz", ignoreCase = true) -> {
+        if (filterComplexArg != null && introVideoFile != null) {
+            if (audioOpt.startsWith("Sessiz", ignoreCase = true) || !hasMappedAudio) {
                 args.add("-an")
-            }
-            audioOpt.contains("320") -> {
+            } else {
                 args.add("-c:a")
                 args.add("aac")
                 args.add("-b:a")
-                args.add("320k")
+                when {
+                    audioOpt.contains("320") -> args.add("320k")
+                    audioOpt.contains("128") -> args.add("128k")
+                    else -> args.add("192k")
+                }
             }
-            audioOpt.contains("192") -> {
-                args.add("-c:a")
-                args.add("aac")
-                args.add("-b:a")
-                args.add("192k")
-            }
-            audioOpt.contains("128") -> {
-                args.add("-c:a")
-                args.add("aac")
-                args.add("-b:a")
-                args.add("128k")
-            }
-            copyAudio -> {
-                args.add("-c:a")
-                args.add("copy")
-            }
-            else -> {
-                args.add("-c:a")
-                args.add("aac")
-                args.add("-b:a")
-                args.add("192k")
+        } else {
+            when {
+                audioOpt.startsWith("Sessiz", ignoreCase = true) -> {
+                    args.add("-an")
+                }
+                audioOpt.contains("320") -> {
+                    args.add("-c:a")
+                    args.add("aac")
+                    args.add("-b:a")
+                    args.add("320k")
+                }
+                audioOpt.contains("192") -> {
+                    args.add("-c:a")
+                    args.add("aac")
+                    args.add("-b:a")
+                    args.add("192k")
+                }
+                audioOpt.contains("128") -> {
+                    args.add("-c:a")
+                    args.add("aac")
+                    args.add("-b:a")
+                    args.add("128k")
+                }
+                copyAudio -> {
+                    args.add("-c:a")
+                    args.add("copy")
+                }
+                else -> {
+                    args.add("-c:a")
+                    args.add("aac")
+                    args.add("-b:a")
+                    args.add("192k")
+                }
             }
         }
 
@@ -726,57 +830,35 @@ object FfmpegEncodeManager {
 
     /**
      * Publishes verified hardsub video to permanent user storage (Movies/RemSubs)
-     * avoiding name collisions:
-     * video.mp4 -> video_encoded.mp4 -> video_encoded_1.mp4 -> video_encoded_2.mp4 ...
+     * using the unified MediaStorageManager pipeline.
      */
     private fun publishToPermanentStorage(
         context: Context,
         tempOutputFile: File,
         originalFileName: String
     ): File? {
-        val moviesDir = File(
-            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES),
-            "RemSubs"
-        ).apply { mkdirs() }
-
-        val permanentFile = resolveUniqueOutputFile(moviesDir, originalFileName)
-
-        return try {
-            FileInputStream(tempOutputFile).use { input ->
-                FileOutputStream(permanentFile).use { output ->
-                    input.copyTo(output)
-                    output.flush()
-                }
-            }
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val values = ContentValues().apply {
-                    put(MediaStore.Video.Media.DISPLAY_NAME, permanentFile.name)
-                    put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-                    put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/RemSubs")
-                    put(MediaStore.Video.Media.IS_PENDING, 0)
-                }
-                try {
-                    context.contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
-                } catch (e: Exception) {
-                    Log.w(TAG, "MediaStore video insert warning: ${e.localizedMessage}")
-                }
-            }
-
-            try {
-                MediaScannerConnection.scanFile(
-                    context,
-                    arrayOf(permanentFile.absolutePath),
-                    arrayOf("video/mp4"),
-                    null
-                )
-            } catch (_: Exception) {}
-
-            permanentFile
-        } catch (e: Exception) {
-            Log.e(TAG, "Error publishing video to permanent storage: ${e.localizedMessage}", e)
-            null
+        val encodedName = resolveEncodedFileName(originalFileName)
+        val result = kotlinx.coroutines.runBlocking {
+            com.example.util.MediaStorageManager.saveVideoToGallery(
+                context = context,
+                sourceFile = tempOutputFile,
+                originalFileName = encodedName
+            )
         }
+        return when (result) {
+            is com.example.torrent.StorageSaveResult.Success -> result.permanentFile
+            is com.example.torrent.StorageSaveResult.Failure -> {
+                Log.e(TAG, "Failed to publish hardsub video: ${result.reason}")
+                null
+            }
+        }
+    }
+
+    private fun resolveEncodedFileName(originalFileName: String): String {
+        val base = originalFileName.substringBeforeLast(".")
+            .replace(Regex("[^a-zA-Z0-9._-]"), "_")
+            .ifBlank { "video" }
+        return "${base}_encoded.mp4"
     }
 
     fun resolveUniqueOutputFile(parentDir: File, originalFileName: String): File {
@@ -832,6 +914,23 @@ object FfmpegEncodeManager {
             Pair(0L, 30.0)
         } finally {
             try { retriever.release() } catch (_: Exception) {}
+        }
+    }
+
+    private fun hasAudioTrack(file: File): Boolean {
+        val extractor = MediaExtractor()
+        return try {
+            extractor.setDataSource(file.absolutePath)
+            for (i in 0 until extractor.trackCount) {
+                val format = extractor.getTrackFormat(i)
+                val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
+                if (mime.startsWith("audio/")) return true
+            }
+            false
+        } catch (_: Exception) {
+            false
+        } finally {
+            try { extractor.release() } catch (_: Exception) {}
         }
     }
 

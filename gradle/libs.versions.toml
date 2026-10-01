@@ -44,6 +44,7 @@ credentials = "1.5.0"
 googleid = "1.1.1"
 ffmpeg-kit = "8.1.7"
 smartException = "0.2.1"
+jlibtorrent = "2.0.11.0"
 
 
 [libraries]
@@ -107,6 +108,9 @@ googleid = { group = "com.google.android.libraries.identity.googleid", name = "g
 ffmpeg-kit-full = { group = "dev.ffmpegkit-maintained", name = "ffmpeg-kit-full-gpl", version.ref = "ffmpeg-kit" }
 smart-exception-java = { group = "com.arthenica", name = "smart-exception-java", version.ref = "smartException" }
 smart-exception-common = { group = "com.arthenica", name = "smart-exception-common", version.ref = "smartException" }
+jlibtorrent = { group = "com.frostwire", name = "jlibtorrent", version.ref = "jlibtorrent" }
+jlibtorrent-android-arm64 = { group = "com.frostwire", name = "jlibtorrent-android-arm64", version.ref = "jlibtorrent" }
+jlibtorrent-android-x64 = { group = "com.frostwire", name = "jlibtorrent-android-x86_64", version.ref = "jlibtorrent" }
 
 
 [plugins]

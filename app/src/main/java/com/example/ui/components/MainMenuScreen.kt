@@ -70,6 +70,7 @@ fun MainMenuScreen(
     onResumeTorrentDownload: () -> Unit = {},
     onCancelTorrentDownload: () -> Unit = {},
     onOpenDownloadedVideo: (File) -> Unit = {},
+    onSelectTorrentVideoFile: (String) -> Unit = {},
     onExtractSubtitleFromVideo: () -> Unit = {}
 ) {
     Scaffold(
@@ -123,7 +124,8 @@ fun MainMenuScreen(
                     onPause = onPauseTorrentDownload,
                     onResume = onResumeTorrentDownload,
                     onCancel = onCancelTorrentDownload,
-                    onOpenDownloadedVideo = onOpenDownloadedVideo
+                    onOpenDownloadedVideo = onOpenDownloadedVideo,
+                    onSelectVideoFile = onSelectTorrentVideoFile
                 )
 
                 // 1. Düz bir dikdörtgen: içinde "video ile altyazı düzenleme"

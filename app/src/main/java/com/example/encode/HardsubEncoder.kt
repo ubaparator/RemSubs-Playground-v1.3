@@ -50,7 +50,10 @@ object HardsubEncoder {
         customFontFile: File? = null,
         additionalStyles: List<String> = emptyList(),
         settings: EncodingSettings = EncodingSettings(),
-        sourceMetadata: SourceVideoMetadata = SourceVideoMetadata()
+        sourceMetadata: SourceVideoMetadata = SourceVideoMetadata(),
+        introVideoUri: Uri? = null,
+        introDurationMs: Long = 0L,
+        introKeepAudio: Boolean = false
     ) {
         FfmpegEncodeManager.startEncode(
             context = context,
@@ -60,7 +63,10 @@ object HardsubEncoder {
             customFontFile = customFontFile,
             additionalStyles = additionalStyles,
             settings = settings,
-            sourceMetadata = sourceMetadata
+            sourceMetadata = sourceMetadata,
+            introVideoUri = introVideoUri,
+            introDurationMs = introDurationMs,
+            introKeepAudio = introKeepAudio
         )
     }
 

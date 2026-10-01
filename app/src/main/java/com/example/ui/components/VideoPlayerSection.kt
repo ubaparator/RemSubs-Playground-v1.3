@@ -253,6 +253,8 @@ fun VideoPlayerSection(
                 activeCues = uiState.activeCues,
                 style = uiState.subtitleStyle,
                 fontFamily = uiState.loadedFontFamily,
+                sourceVideoWidth = uiState.sourceVideoMetadata.width.let { if (it > 0) it else 1920 },
+                sourceVideoHeight = uiState.sourceVideoMetadata.height.let { if (it > 0) it else 1080 },
                 modifier = Modifier.fillMaxSize()
             )
         } else {

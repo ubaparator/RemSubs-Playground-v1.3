@@ -10,57 +10,43 @@ import kotlin.math.roundToInt
 
 object AssGenerator {
 
-    /**
-     * Formats milliseconds to ASS timestamp: H:MM:SS.cs (centiseconds)
-     */
     fun formatAssTimestamp(ms: Long): String {
-        val nonNegativeMs = ms.coerceAtLeast(0L)
-        val hours = nonNegativeMs / 3600000L
-        val minutes = (nonNegativeMs % 3600000L) / 60000L
-        val seconds = (nonNegativeMs % 60000L) / 1000L
-        val centiseconds = (nonNegativeMs % 1000L) / 10L
+        val totalSeconds = ms / 1000
+        val hours = totalSeconds / 3600
+        val minutes = (totalSeconds % 3600) / 60
+        val seconds = totalSeconds % 60
+        val centiseconds = (ms % 1000) / 10
         return String.format(Locale.US, "%d:%02d:%02d.%02d", hours, minutes, seconds, centiseconds)
     }
 
-    /**
-     * Converts Compose Color to ASS color format: &HAABBGGRR
-     * Note: In ASS, 00 is fully opaque, FF is fully transparent
-     */
-    fun colorToAssHex(color: Color): String {
-        val alphaInt = (color.alpha * 255f).roundToInt().coerceIn(0, 255)
-        val assAlpha = 255 - alphaInt // Invert alpha for ASS standard
-        val red = (color.red * 255f).roundToInt().coerceIn(0, 255)
-        val green = (color.green * 255f).roundToInt().coerceIn(0, 255)
-        val blue = (color.blue * 255f).roundToInt().coerceIn(0, 255)
-        return String.format(Locale.US, "&H%02X%02X%02X%02X", assAlpha, blue, green, red)
+    private fun colorToAssHex(color: Color): String {
+        val a = ((1f - color.alpha) * 255).roundToInt().coerceIn(0, 255)
+        val r = (color.red * 255).roundToInt().coerceIn(0, 255)
+        val g = (color.green * 255).roundToInt().coerceIn(0, 255)
+        val b = (color.blue * 255).roundToInt().coerceIn(0, 255)
+        return String.format(Locale.US, "&H%02X%02X%02X%02X", a, b, g, r)
     }
 
-    /**
-     * Converts Compose Color to inline ASS override color tag value: &HBBGGRR&
-     */
     fun colorToInlineAssHex(color: Color): String {
-        val red = (color.red * 255f).roundToInt().coerceIn(0, 255)
-        val green = (color.green * 255f).roundToInt().coerceIn(0, 255)
-        val blue = (color.blue * 255f).roundToInt().coerceIn(0, 255)
-        return String.format(Locale.US, "&H%02X%02X%02X&", blue, green, red)
+        val r = (color.red * 255).roundToInt().coerceIn(0, 255)
+        val g = (color.green * 255).roundToInt().coerceIn(0, 255)
+        val b = (color.blue * 255).roundToInt().coerceIn(0, 255)
+        return String.format(Locale.US, "&H%02X%02X%02X&", b, g, r)
     }
 
-    /**
-     * Maps vertical & horizontal alignments to ASS alignment number (1-9 numpad layout)
-     */
-    fun getAssAlignment(vertical: SubtitleVerticalAlign, horizontal: SubtitleHorizontalAlign): Int {
-        return when (vertical) {
-            SubtitleVerticalAlign.TOP -> when (horizontal) {
+    fun getAssAlignment(vAlign: SubtitleVerticalAlign, hAlign: SubtitleHorizontalAlign): Int {
+        return when (vAlign) {
+            SubtitleVerticalAlign.TOP -> when (hAlign) {
                 SubtitleHorizontalAlign.LEFT -> 7
                 SubtitleHorizontalAlign.CENTER -> 8
                 SubtitleHorizontalAlign.RIGHT -> 9
             }
-            SubtitleVerticalAlign.MIDDLE -> when (horizontal) {
+            SubtitleVerticalAlign.MIDDLE -> when (hAlign) {
                 SubtitleHorizontalAlign.LEFT -> 4
                 SubtitleHorizontalAlign.CENTER -> 5
                 SubtitleHorizontalAlign.RIGHT -> 6
             }
-            SubtitleVerticalAlign.BOTTOM -> when (horizontal) {
+            SubtitleVerticalAlign.BOTTOM -> when (hAlign) {
                 SubtitleHorizontalAlign.LEFT -> 1
                 SubtitleHorizontalAlign.CENTER -> 2
                 SubtitleHorizontalAlign.RIGHT -> 3
@@ -69,9 +55,18 @@ object AssGenerator {
     }
 
     /**
-     * Generates a complete, standard .ASS (Advanced SubStation Alpha v4.00+) script
-     * seamlessly incorporating font styles, positions, and dialogue cues.
+     * Resolves the font size in ASS coordinate units (PlayRes coordinate system).
+     * If user provided a mobile sp value (e.g. 20-30), maps it to standard 1080p ASS size (e.g. ~48-52).
+     * If already in ASS units (>= 32), uses it directly.
      */
+    fun resolveAssFontSize(fontSizeVal: Float, playResY: Int = 1080): Int {
+        return if (fontSizeVal < 32f) {
+            (fontSizeVal * (playResY / 480f)).roundToInt().coerceIn(18, 120)
+        } else {
+            fontSizeVal.roundToInt().coerceIn(14, 180)
+        }
+    }
+
     fun generateAss(
         title: String,
         subtitles: List<SubtitleCue>,
@@ -79,21 +74,18 @@ object AssGenerator {
         applyTimeOffset: Boolean = false,
         videoWidth: Int = 1920,
         videoHeight: Int = 1080,
-        additionalStyles: List<String> = emptyList()
+        additionalStyles: List<String> = emptyList(),
+        introOffsetMs: Long = 0L
     ): String {
         val sb = StringBuilder()
 
         val playResX = if (videoWidth > 0) videoWidth else 1920
         val playResY = if (videoHeight > 0) videoHeight else 1080
 
-        // Scale factor: Reference height in Compose UI preview is 216dp (16:9 on a mobile screen).
-        // For playResY (e.g. 1080), the scale factor is playResY / 216f (e.g. 5.0)
-        val assScale = playResY.toFloat() / 216f
-
         // [Script Info]
         sb.appendLine("[Script Info]")
-        sb.appendLine("; Script generated by remsubs playground (AxiSub)")
-        sb.appendLine("; Synchronized & Styled in Real-time")
+        sb.appendLine("; Script generated by remsubs playground")
+        sb.appendLine("; Unified PlayRes coordinate system (1:1 with video frames)")
         sb.appendLine("Title: $title")
         sb.appendLine("ScriptType: v4.00+")
         sb.appendLine("WrapStyle: 0")
@@ -107,7 +99,7 @@ object AssGenerator {
         sb.appendLine("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding")
 
         val fontName = style.fontName.ifBlank { "Arial" }
-        val fontSize = (style.fontSizeSp * assScale).roundToInt().coerceAtLeast(14)
+        val fontSize = resolveAssFontSize(style.fontSizeSp, playResY)
         val primaryColour = colorToAssHex(style.textColor)
         val secondaryColour = "&H000000FF"
         val outlineColour = colorToAssHex(style.outlineColor)
@@ -116,12 +108,12 @@ object AssGenerator {
         val italic = if (style.isItalic) -1 else 0
         val underline = if (style.isUnderline) -1 else 0
         val borderStyle = if (style.hasBackgroundBox) 3 else 1
-        val outlineWidth = if (style.hasOutline) (style.outlineWidth * assScale).roundToInt().coerceAtLeast(1) else 0
-        val shadowDepth = if (style.hasOutline) (1.5f * assScale).roundToInt().coerceAtLeast(1) else 0
+        val outlineWidth = if (style.hasOutline) style.outlineWidth.roundToInt().coerceAtLeast(1) else 0
+        val shadowDepth = if (style.hasOutline) 2 else 0
         val alignment = getAssAlignment(style.verticalAlign, style.horizontalAlign)
-        val marginL = (style.horizontalPaddingDp * assScale).roundToInt().coerceAtLeast(10)
-        val marginR = (style.horizontalPaddingDp * assScale).roundToInt().coerceAtLeast(10)
-        val marginV = (style.verticalOffsetDp * assScale).roundToInt().coerceAtLeast(10)
+        val marginL = style.horizontalPaddingDp.roundToInt().coerceAtLeast(10)
+        val marginR = style.horizontalPaddingDp.roundToInt().coerceAtLeast(10)
+        val marginV = style.verticalOffsetDp.roundToInt().coerceAtLeast(10)
 
         sb.appendLine("Style: Default,$fontName,$fontSize,$primaryColour,$secondaryColour,$outlineColour,$backColour,$bold,$italic,$underline,0,100,100,0,0,$borderStyle,$outlineWidth,$shadowDepth,$alignment,$marginL,$marginR,$marginV,1")
 
@@ -133,9 +125,9 @@ object AssGenerator {
                 val parts = trimmed.substring(6).trim().split(",")
                 if (parts.isNotEmpty()) {
                     val sName = parts[0].trim()
-                    if (sName.isNotEmpty() && !declaredStyleNames.contains(sName.lowercase())) {
+                    if (sName.isNotEmpty() && !declaredStyleNames.contains(sName.lowercase(Locale.ROOT))) {
                         sb.appendLine(trimmed)
-                        declaredStyleNames.add(sName.lowercase())
+                        declaredStyleNames.add(sName.lowercase(Locale.ROOT))
                     }
                 }
             }
@@ -144,9 +136,9 @@ object AssGenerator {
         // For any cue with a distinct styleName not yet declared, create a fallback style
         for (cue in subtitles) {
             val sName = cue.styleName.trim()
-            if (sName.isNotBlank() && !declaredStyleNames.contains(sName.lowercase())) {
+            if (sName.isNotBlank() && !declaredStyleNames.contains(sName.lowercase(Locale.ROOT))) {
                 sb.appendLine("Style: $sName,$fontName,$fontSize,$primaryColour,$secondaryColour,$outlineColour,$backColour,$bold,$italic,$underline,0,100,100,0,0,$borderStyle,$outlineWidth,$shadowDepth,$alignment,$marginL,$marginR,$marginV,1")
-                declaredStyleNames.add(sName.lowercase())
+                declaredStyleNames.add(sName.lowercase(Locale.ROOT))
             }
         }
 
@@ -156,20 +148,20 @@ object AssGenerator {
         sb.appendLine("[Events]")
         sb.appendLine("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text")
 
-        val timeOffset = if (applyTimeOffset) style.timeOffsetMs else 0L
+        val totalOffset = (if (applyTimeOffset) style.timeOffsetMs else 0L) + introOffsetMs
 
         for (cue in subtitles.sortedBy { it.startTimeMs }) {
-            val startMs = (cue.startTimeMs + timeOffset).coerceAtLeast(0L)
-            val endMs = (cue.endTimeMs + timeOffset).coerceAtLeast(startMs)
+            val startMs = (cue.startTimeMs + totalOffset).coerceAtLeast(0L)
+            val endMs = (cue.endTimeMs + totalOffset).coerceAtLeast(startMs)
             val startStr = formatAssTimestamp(startMs)
             val endStr = formatAssTimestamp(endMs)
 
-            // Format dialogue text with custom per-cue overrides if set
-            val formattedText = formatCueTextForAss(cue, assScale)
+            // Format dialogue text converting any HTML tags to ASS overrides
+            val formattedText = formatCueTextForAss(cue, playResY)
             val layer = cue.layer
             val styleName = if (cue.styleName.isNotBlank()) cue.styleName else "Default"
             val actor = cue.actor
-            val marginVVal = if (cue.marginV > 0) (cue.marginV * assScale).roundToInt() else 0
+            val marginVVal = cue.marginV
 
             sb.appendLine("Dialogue: $layer,$startStr,$endStr,$styleName,$actor,0,0,$marginVVal,,$formattedText")
         }
@@ -177,8 +169,10 @@ object AssGenerator {
         return sb.toString()
     }
 
-    private fun formatCueTextForAss(cue: SubtitleCue, assScale: Float): String {
-        val baseText = (if (cue.rawText.isNotBlank()) cue.rawText else cue.cleanText)
+    private fun formatCueTextForAss(cue: SubtitleCue, playResY: Int): String {
+        val rawOrClean = if (cue.rawText.isNotBlank()) cue.rawText else cue.cleanText
+        // Convert any HTML formatting tags (<i>, <b>, <font>, <br>) to standard ASS override tags
+        val baseText = HtmlSubtitleParser.htmlToAss(rawOrClean)
             .replace("\r\n", "\\N")
             .replace("\n", "\\N")
 
@@ -192,7 +186,8 @@ object AssGenerator {
         tags.append("\\an$customAlign")
 
         cue.customFontSizeSp?.let { size ->
-            tags.append("\\fs${(size * assScale).roundToInt()}")
+            val resolvedSize = resolveAssFontSize(size, playResY)
+            tags.append("\\fs$resolvedSize")
         }
 
         cue.customTextColorArgb?.let { argb ->

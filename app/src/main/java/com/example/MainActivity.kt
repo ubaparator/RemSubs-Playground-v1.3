@@ -231,6 +231,7 @@ fun AxiSubMainScreen(
             onResumeTorrentDownload = viewModel::resumeTorrentDownload,
             onCancelTorrentDownload = viewModel::cancelTorrentDownload,
             onOpenDownloadedVideo = viewModel::openDownloadedVideoInEditor,
+            onSelectTorrentVideoFile = viewModel::selectTorrentVideoFile,
             onExtractSubtitleFromVideo = {
                 mkvVideoPickerLauncher.launch(arrayOf("video/*", "video/x-matroska", "*/*"))
             }
@@ -490,7 +491,11 @@ fun AxiSubMainScreen(
                 exportVideoLauncher.launch(file.name)
             },
             onUpdateSettings = viewModel::updateEncodingSettings,
-            onOpenCompatibilityTest = viewModel::openCompatibilityTest
+            onOpenCompatibilityTest = viewModel::openCompatibilityTest,
+            onSelectIntroVideo = viewModel::setIntroVideo,
+            onRemoveIntroVideo = viewModel::removeIntroVideo,
+            onSetIntroKeepAudio = viewModel::setIntroKeepAudio,
+            onToggleIntroPreview = viewModel::setShowIntroPreview
         )
     }
 
