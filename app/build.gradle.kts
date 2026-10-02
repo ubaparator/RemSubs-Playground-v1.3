@@ -23,7 +23,7 @@ android {
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
     ndk {
-      abiFilters.addAll(listOf("arm64-v8a", "x86_64"))
+      abiFilters.addAll(listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64"))
     }
   }
 
@@ -118,7 +118,9 @@ dependencies {
   implementation(libs.smart.exception.java)
   implementation(libs.smart.exception.common)
   implementation(libs.jlibtorrent)
+  implementation(libs.jlibtorrent.android.arm)
   implementation(libs.jlibtorrent.android.arm64)
+  implementation(libs.jlibtorrent.android.x86)
   implementation(libs.jlibtorrent.android.x64)
   implementation(libs.androidx.media3.exoplayer)
   implementation(libs.androidx.media3.ui)

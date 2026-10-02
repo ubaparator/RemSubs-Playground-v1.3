@@ -82,7 +82,12 @@ object TorrentDownloadManager {
                         AlertType.METADATA_RECEIVED -> {
                             val metaAlert = alert as? MetadataReceivedAlert
                             Log.i(TAG, "[ALERT] metadata_received: ${metaAlert?.torrentName() ?: alert.message()}")
-                            handleMetadataReceived(metaAlert?.handle())
+                            val handle = metaAlert?.handle() ?: activeHandle
+                            if (handle != null && handle.isValid) {
+                                scope.launch(Dispatchers.IO) {
+                                    handleMetadataReceived(handle)
+                                }
+                            }
                         }
                         AlertType.TORRENT_CHECKED -> {
                             Log.i(TAG, "[ALERT] torrent_checked: ${alert.message()}")
@@ -90,12 +95,12 @@ object TorrentDownloadManager {
                         AlertType.PIECE_FINISHED -> {
                             val pieceAlert = alert as? PieceFinishedAlert
                             val pieceIdx = pieceAlert?.pieceIndex() ?: -1
-                            Log.d(TAG, "[ALERT] piece_finished: piece=$pieceIdx ${alert.message()}")
+                            Log.d(TAG, "[ALERT] piece_finished: piece=$pieceIdx")
                         }
                         AlertType.TORRENT_FINISHED -> {
                             val finishedAlert = alert as? TorrentFinishedAlert
                             Log.i(TAG, "[ALERT] torrent_finished: ${finishedAlert?.torrentName() ?: alert.message()}")
-                            scope.launch { onDownloadCompleted() }
+                            scope.launch(Dispatchers.IO) { onDownloadCompleted() }
                         }
                         AlertType.TORRENT_ERROR -> {
                             val errorAlert = alert as? TorrentErrorAlert
@@ -199,40 +204,16 @@ object TorrentDownloadManager {
         )
         logTorrentSnapshot(stateOverride = TorrentState.RESOLVING_METADATA.name)
 
-        scope.launch {
+        scope.launch(Dispatchers.IO) {
             try {
                 if (!ensureSessionStarted()) {
                     throw IllegalStateException("engine init failure: jlibtorrent session could not start")
                 }
                 val sm = sessionManager ?: throw IllegalStateException("engine init failure")
 
-                // Try fetching metadata first with timeout
-                Log.i(TAG, "Fetching magnet metadata via jlibtorrent fetchMagnet: $magnetUri")
-                val metaBytes = withContext(Dispatchers.IO) {
-                    try {
-                        sm.fetchMagnet(magnetUri, 25, targetDir)
-                    } catch (e: Exception) {
-                        Log.w(TAG, "fetchMagnet exception: ${e.localizedMessage}")
-                        null
-                    }
-                }
-
-                if (metaBytes != null && metaBytes.isNotEmpty()) {
-                    Log.i(TAG, "Magnet metadata successfully received (${metaBytes.size} bytes)")
-                    val ti = TorrentInfo(metaBytes)
-                    onMetadataAcquired(ti, targetDir)
-                } else {
-                    Log.i(TAG, "fetchMagnet timed out or returned null, queueing magnet URI directly in session...")
-                    _downloadInfo.update {
-                        it.copy(
-                            statusMessage = "Eşler aranıyor ve meta verisi bekleniyor...",
-                            state = TorrentState.CONNECTING_TRACKERS
-                        )
-                    }
-                    // Download via magnet URI directly
-                    sm.download(magnetUri, targetDir, null)
-                    findAndTrackHandle(infoHashHex)
-                }
+                Log.i(TAG, "Starting magnet download directly in jlibtorrent: $magnetUri")
+                sm.download(magnetUri, targetDir, null)
+                findAndTrackHandle(infoHashHex)
             } catch (t: Throwable) {
                 Log.e(TAG, "startMagnetDownload error: ${t.localizedMessage}", t)
                 val (errType, desc) = classifyError(t)
@@ -272,11 +253,9 @@ object TorrentDownloadManager {
         )
         logTorrentSnapshot(stateOverride = TorrentState.RESOLVING_METADATA.name)
 
-        scope.launch {
+        scope.launch(Dispatchers.IO) {
             try {
-                val bytes = withContext(Dispatchers.IO) {
-                    context.contentResolver.openInputStream(torrentUri)?.use { it.readBytes() }
-                }
+                val bytes = context.contentResolver.openInputStream(torrentUri)?.use { it.readBytes() }
 
                 if (bytes == null || bytes.isEmpty()) {
                     val errPair = Pair(TorrentErrorType.INVALID_TORRENT, ".torrent dosyası okunamadı veya boş.")
@@ -292,7 +271,10 @@ object TorrentDownloadManager {
                     return@launch
                 }
 
-                ensureSessionStarted()
+                if (!ensureSessionStarted()) {
+                    throw IllegalStateException("engine init failure: jlibtorrent session could not start")
+                }
+                val sm = sessionManager ?: throw IllegalStateException("engine init failure")
 
                 val ti = try {
                     TorrentInfo(bytes)
@@ -310,7 +292,50 @@ object TorrentDownloadManager {
                     return@launch
                 }
 
-                onMetadataAcquired(ti, targetDir)
+                activeTorrentInfo = ti
+                val fileStorage = ti.files()
+                val numFiles = fileStorage.numFiles()
+                val fileList = mutableListOf<String>()
+                for (i in 0 until numFiles) fileList.add(fileStorage.filePath(i))
+
+                val videoFiles = fileList.filter { MediaStorageManager.isVideoFile(it) }
+                val selectedVideo = if (videoFiles.isNotEmpty()) {
+                    videoFiles.maxByOrNull { path ->
+                        val idx = fileList.indexOf(path)
+                        if (idx >= 0) fileStorage.fileSize(idx) else 0L
+                    } ?: videoFiles.first()
+                } else if (fileList.isNotEmpty()) fileList.first() else ""
+
+                val priorities = Array(numFiles) { i ->
+                    val path = fileStorage.filePath(i)
+                    if (path == selectedVideo || path.endsWith(selectedVideo)) {
+                        Priority.fromSwig(4)
+                    } else if (MediaStorageManager.isVideoFile(path)) {
+                        Priority.fromSwig(1)
+                    } else {
+                        Priority.IGNORE
+                    }
+                }
+
+                sm.download(ti, targetDir, null, priorities, null, null)
+                val handle = sm.find(ti.infoHash())
+                activeHandle = handle
+
+                _downloadInfo.update {
+                    it.copy(
+                        torrentName = ti.name(),
+                        infoHashHex = ti.infoHash().toHex(),
+                        totalBytes = ti.totalSize(),
+                        pieceCount = ti.numPieces(),
+                        pieceSize = ti.pieceLength(),
+                        files = fileList,
+                        selectedVideoFileName = selectedVideo,
+                        state = TorrentState.DOWNLOADING,
+                        statusMessage = "İndiriliyor"
+                    )
+                }
+                logTorrentSnapshot(stateOverride = TorrentState.DOWNLOADING.name)
+                startStatusMonitor()
 
             } catch (t: Throwable) {
                 Log.e(TAG, "startTorrentFileDownload error: ${t.localizedMessage}", t)
@@ -328,8 +353,18 @@ object TorrentDownloadManager {
         }
     }
 
-    private fun onMetadataAcquired(ti: TorrentInfo, targetDir: File) {
+    private fun handleMetadataReceived(handle: TorrentHandle) {
+        if (!handle.isValid) return
+        val ti = try {
+            handle.torrentFile()
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to get torrentFile from handle: ${e.localizedMessage}")
+            null
+        } ?: return
+
         activeTorrentInfo = ti
+        activeHandle = handle
+
         val name = ti.name()
         val totalSize = ti.totalSize()
         val numPieces = ti.numPieces()
@@ -344,22 +379,39 @@ object TorrentDownloadManager {
         }
 
         // Multi-file handling: identify primary video file and configure priorities
-        var selectedVideo = ""
+        var selectedVideo = _downloadInfo.value.selectedVideoFileName
+        if (selectedVideo.isBlank() || !fileList.contains(selectedVideo)) {
+            val videoFiles = fileList.filter { MediaStorageManager.isVideoFile(it) }
+            selectedVideo = if (videoFiles.isNotEmpty()) {
+                videoFiles.maxByOrNull { path ->
+                    val idx = fileList.indexOf(path)
+                    if (idx >= 0) fileStorage.fileSize(idx) else 0L
+                } ?: videoFiles.first()
+            } else if (fileList.isNotEmpty()) {
+                fileList.first()
+            } else ""
+        }
+
         val priorities = Array(numFiles) { i ->
             val path = fileStorage.filePath(i)
-            if (MediaStorageManager.isVideoFile(path)) {
-                if (selectedVideo.isEmpty()) selectedVideo = path
-                Priority.fromSwig(4)
+            if (path == selectedVideo || path.endsWith(selectedVideo)) {
+                Priority.fromSwig(4) // High priority for chosen video
+            } else if (MediaStorageManager.isVideoFile(path)) {
+                Priority.fromSwig(1) // Normal priority for other videos
             } else {
-                Priority.IGNORE
+                Priority.IGNORE // Ignore non-video/sample/nfo files
             }
         }
 
-        // If no file matched video extensions, default all files to DEFAULT
-        if (selectedVideo.isEmpty() && numFiles > 0) {
-            selectedVideo = fileStorage.filePath(0)
-            for (i in priorities.indices) priorities[i] = Priority.fromSwig(4)
+        try {
+            handle.prioritizeFiles(priorities)
+        } catch (e: Exception) {
+            Log.w(TAG, "prioritizeFiles error: ${e.localizedMessage}")
         }
+
+        try {
+            handle.resume()
+        } catch (_: Exception) {}
 
         Log.i(TAG, """
             [TORRENT METADATA ACQUIRED]
@@ -387,27 +439,7 @@ object TorrentDownloadManager {
         }
         logTorrentSnapshot(stateOverride = TorrentState.DOWNLOADING.name)
 
-        // Queue download in jlibtorrent session
-        val sm = sessionManager ?: throw IllegalStateException("engine init failure: jlibtorrent not available")
-        try {
-            sm.download(ti, targetDir, null, priorities, null, null)
-        } catch (_: Exception) {
-            sm.download(ti, targetDir)
-        }
-
-        val handle = sm.find(ti.infoHash())
-        activeHandle = handle
-
         startStatusMonitor()
-    }
-
-    private fun handleMetadataReceived(handle: TorrentHandle?) {
-        val h = handle ?: activeHandle ?: return
-        if (!h.isValid) return
-        val ti = h.torrentFile() ?: return
-        if (activeTorrentInfo == null) {
-            activeDownloadDir?.let { onMetadataAcquired(ti, it) }
-        }
     }
 
     private fun findAndTrackHandle(infoHashHex: String) {
@@ -712,7 +744,11 @@ object TorrentDownloadManager {
         downloadMonitorJob?.cancel()
         downloadMonitorJob = null
         try {
-            activeHandle?.pause()
+            val handle = activeHandle
+            if (handle != null && handle.isValid) {
+                handle.pause()
+                sessionManager?.remove(handle)
+            }
         } catch (_: Exception) {}
         activeHandle = null
         activeTorrentInfo = null
