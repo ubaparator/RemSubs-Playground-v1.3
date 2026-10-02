@@ -1,5 +1,6 @@
 package com.example
 
+import android.content.ActivityNotFoundException
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -55,6 +56,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -70,6 +72,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.ui.AppScreen
 import com.example.ui.AxiSubViewModel
+import com.example.ui.components.AnimeSearchScreen
 import com.example.ui.components.AssExportDialog
 import com.example.ui.components.EditSubtitleCueDialog
 import com.example.ui.components.FontAndStyleSection
@@ -78,9 +81,12 @@ import com.example.ui.components.MainMenuScreen
 import com.example.ui.components.MkvSubtitleExtractionDialog
 import com.example.ui.components.SubtitleListSection
 import com.example.ui.components.ModernSubtitleEditorScreen
+import com.example.ui.components.UpdateReadyDialog
 import com.example.ui.components.VideoInfoSection
 import com.example.ui.components.VideoPlayerSection
 import com.example.ui.theme.MyApplicationTheme
+import com.example.update.AppUpdater
+import com.example.update.UpdateState
 import java.io.File
 
 class MainActivity : ComponentActivity() {
@@ -104,9 +110,43 @@ fun AxiSubMainScreen(
     val uiState by viewModel.uiState.collectAsState()
     val encodeState by viewModel.encodeState.collectAsState()
     val torrentDownloadInfo by viewModel.torrentDownloadInfo.collectAsState()
+    val animeSearchState by viewModel.animeSearchState.collectAsState()
+    val updateState by viewModel.updateState.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
     var pendingVideoToSave by remember { mutableStateOf<File?>(null) }
     var pendingExtractedSubtitleToSave by remember { mutableStateOf<File?>(null) }
+    var updateDialogDismissed by rememberSaveable { mutableStateOf(false) }
+
+    val launchUpdateInstaller: () -> Unit = {
+        (viewModel.updateState.value as? UpdateState.ReadyToInstall)?.let { ready ->
+            try {
+                context.startActivity(AppUpdater.installIntent(context, ready.apk))
+            } catch (e: ActivityNotFoundException) {
+                Toast.makeText(context, "Sistem yükleyicisi açılamadı: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    // Returning from the "install unknown apps" settings page continues straight to the installer
+    val installPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) {
+        if (AppUpdater.canRequestInstalls(context)) launchUpdateInstaller()
+    }
+
+    val installUpdate: () -> Unit = {
+        updateDialogDismissed = true
+        if (AppUpdater.canRequestInstalls(context)) {
+            launchUpdateInstaller()
+        } else {
+            Toast.makeText(
+                context,
+                "Güncellemeyi kurabilmek için RemSubs'a \"Bilinmeyen uygulamaları yükle\" izni ver, sonra geri dön.",
+                Toast.LENGTH_LONG
+            ).show()
+            installPermissionLauncher.launch(AppUpdater.installPermissionIntent(context))
+        }
+    }
 
     // Save Extracted Subtitle to Device
     val saveExtractedSubtitleLauncher = rememberLauncherForActivityResult(
@@ -206,7 +246,24 @@ fun AxiSubMainScreen(
         }
     }
 
-    if (uiState.currentScreen == AppScreen.MAIN_MENU) {
+    if (uiState.currentScreen == AppScreen.ANIME_SEARCH) {
+        BackHandler {
+            viewModel.navigateToMainMenu()
+        }
+
+        AnimeSearchScreen(
+            state = animeSearchState,
+            torrentDownloadInfo = torrentDownloadInfo,
+            onBack = viewModel::navigateToMainMenu,
+            onQueryChange = viewModel::updateAnimeSearchQuery,
+            onSearch = viewModel::runAnimeSearch,
+            onSelectSource = viewModel::selectAnimeSource,
+            onSelectQuality = viewModel::selectAnimeQuality,
+            onToggleSortBySeeders = viewModel::toggleAnimeSortBySeeders,
+            onDownload = viewModel::downloadAnimeSearchResult,
+            snackbarHostState = snackbarHostState
+        )
+    } else if (uiState.currentScreen == AppScreen.MAIN_MENU) {
         // 1. Initial Main Menu on startup (with Torrent/Magnet Downloader & option: video ile altyazı düzenleme)
         MainMenuScreen(
             uiState = uiState,
@@ -235,8 +292,27 @@ fun AxiSubMainScreen(
             onSelectTorrentVideoFile = viewModel::selectTorrentVideoFile,
             onExtractSubtitleFromVideo = {
                 mkvVideoPickerLauncher.launch(arrayOf("video/*", "video/x-matroska", "*/*"))
-            }
+            },
+            onOpenAnimeSearch = viewModel::openAnimeSearch,
+            onRetryTorrentDownload = viewModel::retryTorrentDownload,
+            onSaveTorrentToGallery = viewModel::saveTorrentDownloadToGallery,
+            updateState = updateState,
+            onInstallUpdate = installUpdate,
+            onRetryUpdate = viewModel::checkForUpdates,
+            versionName = BuildConfig.VERSION_NAME,
+            snackbarHostState = snackbarHostState
         )
+
+        (updateState as? UpdateState.ReadyToInstall)?.let { ready ->
+            if (!updateDialogDismissed) {
+                UpdateReadyDialog(
+                    info = ready.info,
+                    activeDownloadName = torrentDownloadInfo.takeIf { it.isActive }?.torrentName,
+                    onInstall = installUpdate,
+                    onLater = { updateDialogDismissed = true }
+                )
+            }
+        }
     } else {
         // 2. Redesigned Modern Subtitle Editor Screen
         BackHandler {

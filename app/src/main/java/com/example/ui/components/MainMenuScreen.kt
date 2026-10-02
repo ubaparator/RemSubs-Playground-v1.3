@@ -29,6 +29,8 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
@@ -45,6 +47,7 @@ import androidx.compose.ui.unit.sp
 import com.example.R
 import com.example.torrent.TorrentDownloadInfo
 import com.example.ui.AxiSubUiState
+import com.example.update.UpdateState
 import java.io.File
 
 /**
@@ -71,9 +74,18 @@ fun MainMenuScreen(
     onCancelTorrentDownload: () -> Unit = {},
     onOpenDownloadedVideo: (File) -> Unit = {},
     onSelectTorrentVideoFile: (String) -> Unit = {},
-    onExtractSubtitleFromVideo: () -> Unit = {}
+    onExtractSubtitleFromVideo: () -> Unit = {},
+    onOpenAnimeSearch: () -> Unit = {},
+    onRetryTorrentDownload: () -> Unit = {},
+    onSaveTorrentToGallery: () -> Unit = {},
+    updateState: UpdateState = UpdateState.Idle,
+    onInstallUpdate: () -> Unit = {},
+    onRetryUpdate: () -> Unit = {},
+    versionName: String = "",
+    snackbarHostState: SnackbarHostState? = null
 ) {
     Scaffold(
+        snackbarHost = { snackbarHostState?.let { SnackbarHost(it) } },
         topBar = {
             TopAppBar(
                 title = {
@@ -116,6 +128,13 @@ fun MainMenuScreen(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(20.dp)
             ) {
+                // GitHub update in progress / ready (hidden when there is none)
+                UpdateBanner(
+                    state = updateState,
+                    onInstall = onInstallUpdate,
+                    onRetry = onRetryUpdate
+                )
+
                 // 0. MAGNET / TORRENT DOWNLOADER SECTION (Yerleşim: "video ile altyazı düzenleme" ÜSTÜNDE)
                 TorrentDownloadSection(
                     downloadInfo = torrentDownloadInfo,
@@ -125,7 +144,10 @@ fun MainMenuScreen(
                     onResume = onResumeTorrentDownload,
                     onCancel = onCancelTorrentDownload,
                     onOpenDownloadedVideo = onOpenDownloadedVideo,
-                    onSelectVideoFile = onSelectTorrentVideoFile
+                    onSelectVideoFile = onSelectTorrentVideoFile,
+                    onOpenAnimeSearch = onOpenAnimeSearch,
+                    onRetry = onRetryTorrentDownload,
+                    onSaveToGallery = onSaveTorrentToGallery
                 )
 
                 // 1. Düz bir dikdörtgen: içinde "video ile altyazı düzenleme"
@@ -251,6 +273,14 @@ fun MainMenuScreen(
                             )
                         }
                     }
+                }
+
+                if (versionName.isNotBlank()) {
+                    Text(
+                        text = "Sürüm $versionName",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.outline
+                    )
                 }
 
                 Spacer(modifier = Modifier.height(16.dp))

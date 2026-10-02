@@ -1,23 +1,31 @@
 name: Build RemSubs APK
 
+# Her main push'unda imzalı APK derlenir ve GitHub Release olarak yayınlanır.
+# Uygulama açılışta releases/latest/download/update.json'u okur, yeni sürümü indirip kurar.
 on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
-    name: Build Latest APK
+    name: Build & publish APK
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
-      # main branch'in EN GÜNCEL halini al
-      - name: Checkout latest repository
+      - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: main
           fetch-depth: 1
 
       # Workflow dosyalarını build kaynaklarından çıkar
@@ -41,43 +49,121 @@ jobs:
         with:
           gradle-version: "9.3.1"
 
-      # Debug signing
-      - name: Create debug keystore
+      # Her çalıştırma daha büyük bir versionCode alır; uygulama içi güncelleyici bunu karşılaştırır.
+      # Workflow yeniden adlandırılırsa run_number sıfırlanır: o zaman VERSION_CODE_OFFSET
+      # repository variable'ını büyütün.
+      - name: Compute version
+        id: version
         shell: bash
         run: |
-          keytool -genkeypair \
-            -v \
-            -keystore debug.keystore \
-            -storepass android \
-            -alias androiddebugkey \
-            -keypass android \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US"
+          OFFSET="${{ vars.VERSION_CODE_OFFSET }}"
+          CODE=$(( ${{ github.run_number }} + ${OFFSET:-100} ))
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "name=1.3.$CODE" >> "$GITHUB_OUTPUT"
+
+      # Tüm sürümler aynı anahtarla imzalanmalı; aksi halde Android güncellemeyi kurmaz.
+      - name: Prepare signing key
+        id: signing
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.REMSUBS_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/remsubs-release.jks"
+            echo "path=$RUNNER_TEMP/remsubs-release.jks" >> "$GITHUB_OUTPUT"
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::REMSUBS_KEYSTORE_BASE64 secret tanımlı değil. APK geçici bir anahtarla imzalanacak ve Release yayınlanmayacak (uygulama içi güncelleme çalışmaz)."
+            keytool -genkeypair \
+              -keystore debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          fi
 
       # APK build
       - name: Build APK
         env:
           JAVA_TOOL_OPTIONS: "-Djava.awt.headless=true"
+          KEYSTORE_PATH: ${{ steps.signing.outputs.path }}
+          STORE_PASSWORD: ${{ secrets.REMSUBS_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.REMSUBS_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: upload
+          REMSUBS_VERSION_CODE: ${{ steps.version.outputs.code }}
+          REMSUBS_VERSION_NAME: ${{ steps.version.outputs.name }}
+          REMSUBS_UPDATE_MANIFEST_URL: ${{ steps.signing.outputs.signed == 'true' && format('https://github.com/{0}/releases/latest/download/update.json', github.repository) || '' }}
         run: |
-          gradle :app:assembleDebug \
+          gradle :app:assembleRelease \
             --no-daemon \
-            --stacktrace \
-            --info
+            --stacktrace
 
-      # APK kontrolü
-      - name: Verify APK
+      - name: Prepare release files
+        id: release
         shell: bash
         run: |
-          echo "Generated APK:"
-          find app/build/outputs/apk -type f -name "*.apk" -print
+          APK=$(find app/build/outputs/apk/release -type f -name "*.apk" | head -n 1)
+          if [ -z "$APK" ]; then
+            echo "::error::APK bulunamadı"
+            exit 1
+          fi
+          mkdir -p dist
+          cp "$APK" dist/RemSubs.apk
+          CODE="${{ steps.version.outputs.code }}"
+          NAME="${{ steps.version.outputs.name }}"
+          TAG="build-$CODE"
+          NOTES=$(git log -1 --pretty=%s)
+          jq -n \
+            --argjson versionCode "$CODE" \
+            --arg versionName "$NAME" \
+            --arg apkUrl "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/RemSubs.apk" \
+            --arg sha256 "$(sha256sum dist/RemSubs.apk | cut -d' ' -f1)" \
+            --argjson size "$(stat -c%s dist/RemSubs.apk)" \
+            --arg notes "$NOTES" \
+            '{versionCode: $versionCode, versionName: $versionName, apkUrl: $apkUrl, sha256: $sha256, size: $size, notes: $notes}' \
+            > dist/update.json
+          cat dist/update.json
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "notes<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$NOTES" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
 
       # APK'yı indirilebilir Artifact yap
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: RemSubs-APK
-          path: app/build/outputs/apk/debug/*.apk
+          path: dist/RemSubs.apk
           if-no-files-found: error
           retention-days: 7
+
+      # Güncelleme kanalı: uygulamalar en son Release'deki update.json'u okur
+      - name: Publish release
+        if: steps.signing.outputs.signed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          NOTES: ${{ steps.release.outputs.notes }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/RemSubs.apk dist/update.json --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" dist/RemSubs.apk dist/update.json \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "RemSubs ${{ steps.version.outputs.name }}" \
+              --notes "$NOTES" \
+              --latest
+          fi
+
+          # Sadece son 5 otomatik sürümü sakla
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,createdAt \
+            --jq '[.[] | select(.tagName | startswith("build-"))] | sort_by(.createdAt) | reverse | .[5:] | .[].tagName' \
+            | while read -r old; do
+                gh release delete "$old" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+              done
