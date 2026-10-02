@@ -12,8 +12,18 @@ import com.example.model.SubtitleStyle
 import com.example.model.SubtitleVerticalAlign
 import com.example.parser.AssGenerator
 import com.example.parser.SubtitleParser
+import com.example.search.AnimeSearchException
+import com.example.search.AnimeSearchRepository
+import com.example.search.AnimeSearchResult
+import com.example.search.AnimeSearchUiState
+import com.example.search.AnimeSource
+import com.example.search.VideoQuality
+import com.example.update.AppUpdater
+import com.example.update.UpdateState
 import com.example.util.FontManager
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -26,7 +36,8 @@ import java.io.File
 
 enum class AppScreen {
     MAIN_MENU,
-    EDITOR
+    EDITOR,
+    ANIME_SEARCH
 }
 
 data class AxiSubUiState(
@@ -235,9 +246,18 @@ class AxiSubViewModel(application: Application) : AndroidViewModel(application) 
     val torrentDownloadInfo: StateFlow<com.example.torrent.TorrentDownloadInfo> =
         com.example.torrent.TorrentDownloadManager.downloadInfo
 
+    private val _animeSearchState = MutableStateFlow(AnimeSearchUiState())
+    val animeSearchState: StateFlow<AnimeSearchUiState> = _animeSearchState.asStateFlow()
+    private var animeSearchJob: Job? = null
+
+    private val _updateState = MutableStateFlow<UpdateState>(UpdateState.Idle)
+    val updateState: StateFlow<UpdateState> = _updateState.asStateFlow()
+    private var updateJob: Job? = null
+
     init {
         // Load default sample demo on first startup so emulator has immediate working preview
         loadDemoMedia()
+        checkForUpdates()
     }
 
     private fun generateAssString(
@@ -711,20 +731,137 @@ class AxiSubViewModel(application: Application) : AndroidViewModel(application) 
         com.example.torrent.TorrentDownloadManager.cancelDownload()
     }
 
+    fun retryTorrentDownload() {
+        com.example.torrent.TorrentDownloadManager.retryLastDownload(getApplication())
+    }
+
+    fun saveTorrentDownloadToGallery() {
+        com.example.torrent.TorrentDownloadManager.saveDownloadedVideoToGallery(getApplication())
+    }
+
     fun selectTorrentVideoFile(fileName: String) {
         com.example.torrent.TorrentDownloadManager.selectVideoFile(fileName)
     }
 
     fun openDownloadedVideoInEditor(file: File) {
-        val permanentUri = com.example.torrent.TorrentDownloadManager.downloadInfo.value.permanentUri
-        val uri = permanentUri ?: Uri.fromFile(file)
-        loadLocalVideo(uri)
+        // The download stays in app storage, so the editor reads the file directly
+        loadLocalVideo(Uri.fromFile(file))
         navigateToEditor()
         _uiState.update {
             it.copy(
                 isHardsubVideoPlaying = false,
                 statusMessage = "İndirilen torrent videosu düzenleyiciye aktarıldı!"
             )
+        }
+    }
+
+    fun openAnimeSearch() {
+        _uiState.update { it.copy(currentScreen = AppScreen.ANIME_SEARCH) }
+    }
+
+    fun updateAnimeSearchQuery(query: String) {
+        _animeSearchState.update { it.copy(query = query) }
+    }
+
+    fun selectAnimeSource(source: AnimeSource) {
+        if (_animeSearchState.value.source == source) return
+        _animeSearchState.update { it.copy(source = source, results = emptyList(), errorMessage = null) }
+        if (_animeSearchState.value.lastSearchedQuery != null) runAnimeSearch()
+    }
+
+    fun selectAnimeQuality(quality: VideoQuality) {
+        if (_animeSearchState.value.quality == quality) return
+        _animeSearchState.update { it.copy(quality = quality) }
+        if (_animeSearchState.value.lastSearchedQuery != null) runAnimeSearch()
+    }
+
+    fun toggleAnimeSortBySeeders() {
+        _animeSearchState.update { it.copy(sortBySeeders = !it.sortBySeeders) }
+    }
+
+    fun runAnimeSearch() {
+        val state = _animeSearchState.value
+        val query = state.query.trim()
+        if (query.length < 2) {
+            _animeSearchState.update { it.copy(errorMessage = "Aramak için en az 2 harf yaz.") }
+            return
+        }
+        animeSearchJob?.cancel()
+        _animeSearchState.update { it.copy(isLoading = true, errorMessage = null) }
+        animeSearchJob = viewModelScope.launch {
+            try {
+                val results = AnimeSearchRepository.search(query, state.source, state.quality)
+                _animeSearchState.update {
+                    it.copy(isLoading = false, results = results, lastSearchedQuery = query, errorMessage = null)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: AnimeSearchException) {
+                _animeSearchState.update {
+                    it.copy(isLoading = false, results = emptyList(), lastSearchedQuery = query, errorMessage = e.message)
+                }
+            } catch (t: Throwable) {
+                android.util.Log.e("AxiSubViewModel", "Anime search failed", t)
+                _animeSearchState.update {
+                    it.copy(
+                        isLoading = false,
+                        results = emptyList(),
+                        lastSearchedQuery = query,
+                        errorMessage = "Arama başarısız: ${t.localizedMessage ?: t.javaClass.simpleName}"
+                    )
+                }
+            }
+        }
+    }
+
+    fun downloadAnimeSearchResult(result: AnimeSearchResult) {
+        com.example.torrent.TorrentDownloadManager.startMagnetDownload(
+            context = getApplication(),
+            magnetUri = result.magnetUri,
+            displayName = result.title,
+            sourceLabel = result.source.displayName
+        )
+        _uiState.update {
+            it.copy(
+                currentScreen = AppScreen.MAIN_MENU,
+                statusMessage = "İndirme başlatıldı: ${result.title}"
+            )
+        }
+    }
+
+    /** Checks GitHub for a newer build and downloads it in the background (on any network). */
+    fun checkForUpdates() {
+        if (!AppUpdater.isConfigured || updateJob?.isActive == true) return
+        updateJob = viewModelScope.launch {
+            val context = getApplication<Application>()
+            _updateState.value = UpdateState.Checking
+            val info = try {
+                AppUpdater.cleanup(context)
+                AppUpdater.fetchLatest()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                // Offline or GitHub unreachable: stay quiet and try again on the next launch
+                android.util.Log.w("AxiSubViewModel", "Update check failed: ${t.message}")
+                _updateState.value = UpdateState.Idle
+                return@launch
+            }
+            if (info.versionCode <= AppUpdater.currentVersionCode(context)) {
+                _updateState.value = UpdateState.Idle
+                return@launch
+            }
+            _updateState.value = UpdateState.Downloading(info, 0f)
+            try {
+                val apk = AppUpdater.download(context, info) { progress ->
+                    _updateState.value = UpdateState.Downloading(info, progress)
+                }
+                _updateState.value = UpdateState.ReadyToInstall(info, apk)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                android.util.Log.w("AxiSubViewModel", "Update download failed", t)
+                _updateState.value = UpdateState.Failed(info, t.message ?: "Güncelleme indirilemedi.")
+            }
         }
     }
 

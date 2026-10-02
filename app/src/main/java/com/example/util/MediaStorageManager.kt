@@ -139,7 +139,6 @@ object MediaStorageManager {
         val safeName = sanitizeFileName(originalFileName.ifBlank { sourceFile.name })
         val isVideo = isVideoFile(safeName)
         val mimeType = mimeTypeOverride ?: resolveExactMimeType(safeName, sourceFile)
-        val totalBytes = sourceFile.length()
 
         // 1. Guaranteed permanent app storage file in Movies
         val permanentLocalDir = if (isVideo) {
@@ -163,70 +162,9 @@ object MediaStorageManager {
             sourceFile
         }
 
-        var publicUri: Uri? = null
-
         // 2. Publish to MediaStore for Android Gallery / Google Photos indexing
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val values = ContentValues().apply {
-                    put(MediaStore.MediaColumns.DISPLAY_NAME, finalVerifiedFile.name)
-                    put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
-                    if (isVideo) {
-                        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/RemSubs")
-                    } else {
-                        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/RemSubs")
-                    }
-                    put(MediaStore.MediaColumns.IS_PENDING, 1)
-                }
-
-                val collectionUri = if (isVideo) {
-                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-                } else {
-                    MediaStore.Downloads.EXTERNAL_CONTENT_URI
-                }
-
-                val targetUri = try {
-                    context.contentResolver.insert(collectionUri, values)
-                } catch (e: Exception) {
-                    Log.w(TAG, "MediaStore insert warning: ${e.localizedMessage}")
-                    null
-                }
-
-                if (targetUri != null) {
-                    val buffer = ByteArray(256 * 1024)
-                    var bytesWritten = 0L
-                    context.contentResolver.openOutputStream(targetUri)?.use { os ->
-                        FileInputStream(finalVerifiedFile).use { fis ->
-                            var read: Int
-                            while (fis.read(buffer).also { read = it } != -1) {
-                                os.write(buffer, 0, read)
-                                bytesWritten += read
-                                val prog = (bytesWritten.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f)
-                                onProgress?.invoke(prog, bytesWritten, totalBytes)
-                            }
-                            os.flush()
-                        }
-                    }
-
-                    // Release pending flag to publish in Gallery
-                    val publishValues = ContentValues().apply {
-                        put(MediaStore.MediaColumns.IS_PENDING, 0)
-                    }
-                    context.contentResolver.update(targetUri, publishValues, null, null)
-                    publicUri = targetUri
-                }
-            } else {
-                // Legacy Android 9 and below
-                val targetDir = if (isVideo) {
-                    File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES), "RemSubs")
-                } else {
-                    File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "RemSubs")
-                }.apply { mkdirs() }
-
-                val publicDest = resolveUniqueFile(targetDir, safeName)
-                finalVerifiedFile.copyTo(publicDest, overwrite = true)
-                publicUri = Uri.fromFile(publicDest)
-            }
+            val publicUri = writeToSharedStorage(context, finalVerifiedFile, safeName, mimeType, isVideo, onProgress)
 
             // 3. MediaScanner trigger for immediate Gallery visibility
             try {
@@ -245,6 +183,116 @@ object MediaStorageManager {
         } catch (e: Exception) {
             Log.e(TAG, "Error saving video to Gallery: ${e.localizedMessage}", e)
             StorageSaveResult.Failure("Galeriye kaydetme hatası: ${e.localizedMessage}")
+        }
+    }
+
+    /**
+     * Publishes an existing file to the Gallery (Movies/RemSubs) with a single MediaStore copy.
+     * Unlike [saveVideoToGallery] it keeps no extra app-private duplicate, which matters for
+     * multi-GB torrent downloads that already live in app storage.
+     */
+    suspend fun publishToGallery(
+        context: Context,
+        sourceFile: File,
+        displayName: String = sourceFile.name,
+        onProgress: ((progress: Float, writtenBytes: Long, totalBytes: Long) -> Unit)? = null
+    ): StorageSaveResult = withContext(Dispatchers.IO) {
+        if (!sourceFile.exists() || sourceFile.length() <= 0L) {
+            return@withContext StorageSaveResult.Failure("Kaynak dosya bulunamadı veya boş.")
+        }
+        val safeName = sanitizeFileName(displayName.ifBlank { sourceFile.name })
+        val mimeType = resolveExactMimeType(safeName, sourceFile)
+        try {
+            val publicUri = writeToSharedStorage(context, sourceFile, safeName, mimeType, isVideoFile(safeName), onProgress)
+                ?: return@withContext StorageSaveResult.Failure("Galeri kaydı oluşturulamadı.")
+            StorageSaveResult.Success(permanentUri = publicUri, permanentFile = sourceFile)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error publishing to Gallery: ${e.localizedMessage}", e)
+            val reason = if (e.localizedMessage?.contains("No space", ignoreCase = true) == true) {
+                "Galeriye kaydedilemedi: cihazda yeterli boş alan yok."
+            } else {
+                "Galeriye kaydetme hatası: ${e.localizedMessage}"
+            }
+            StorageSaveResult.Failure(reason)
+        }
+    }
+
+    /**
+     * Copies [source] into shared storage (MediaStore on Android 10+, public Movies/Downloads
+     * folder before that). Returns the public Uri, or null when MediaStore refused the insert.
+     */
+    private fun writeToSharedStorage(
+        context: Context,
+        source: File,
+        displayName: String,
+        mimeType: String,
+        isVideo: Boolean,
+        onProgress: ((progress: Float, writtenBytes: Long, totalBytes: Long) -> Unit)?
+    ): Uri? {
+        val totalBytes = source.length()
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            // Legacy Android 9 and below
+            val targetDir = if (isVideo) {
+                File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES), "RemSubs")
+            } else {
+                File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "RemSubs")
+            }.apply { mkdirs() }
+
+            val publicDest = resolveUniqueFile(targetDir, displayName)
+            source.copyTo(publicDest, overwrite = true)
+            return Uri.fromFile(publicDest)
+        }
+
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+            put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+            if (isVideo) {
+                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/RemSubs")
+            } else {
+                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/RemSubs")
+            }
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+
+        val collectionUri = if (isVideo) {
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+        } else {
+            MediaStore.Downloads.EXTERNAL_CONTENT_URI
+        }
+
+        val targetUri = try {
+            context.contentResolver.insert(collectionUri, values)
+        } catch (e: Exception) {
+            Log.w(TAG, "MediaStore insert warning: ${e.localizedMessage}")
+            null
+        } ?: return null
+
+        try {
+            val buffer = ByteArray(256 * 1024)
+            var bytesWritten = 0L
+            context.contentResolver.openOutputStream(targetUri)?.use { os ->
+                FileInputStream(source).use { fis ->
+                    var read: Int
+                    while (fis.read(buffer).also { read = it } != -1) {
+                        os.write(buffer, 0, read)
+                        bytesWritten += read
+                        val prog = (bytesWritten.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f)
+                        onProgress?.invoke(prog, bytesWritten, totalBytes)
+                    }
+                    os.flush()
+                }
+            }
+
+            // Release pending flag to publish in Gallery
+            val publishValues = ContentValues().apply {
+                put(MediaStore.MediaColumns.IS_PENDING, 0)
+            }
+            context.contentResolver.update(targetUri, publishValues, null, null)
+            return targetUri
+        } catch (e: Exception) {
+            // Don't leave a half-written, invisible pending entry behind
+            try { context.contentResolver.delete(targetUri, null, null) } catch (_: Exception) {}
+            throw e
         }
     }
 }

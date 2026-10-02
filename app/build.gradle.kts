@@ -17,8 +17,11 @@ android {
     applicationId = "com.aistudio.applet.zncdni"
     minSdk = 24
     targetSdk = 36
-    versionCode = 1
-    versionName = "1.0"
+    // CI sets these per build; the in-app updater compares versionCode with update.json
+    versionCode = System.getenv("REMSUBS_VERSION_CODE")?.toIntOrNull() ?: 1
+    versionName = System.getenv("REMSUBS_VERSION_NAME") ?: "1.3-local"
+    // Empty for local builds, so they never replace themselves with a CI build
+    buildConfigField("String", "UPDATE_MANIFEST_URL", "\"${System.getenv("REMSUBS_UPDATE_MANIFEST_URL") ?: ""}\"")
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -29,12 +32,13 @@ android {
 
   signingConfigs {
     create("release") {
-      val keystorePath = System.getenv("KEYSTORE_PATH") ?: "${rootDir}/my-upload-key.jks"
+      // CI passes an empty KEYSTORE_PATH when the signing secret is missing
+      val keystorePath = System.getenv("KEYSTORE_PATH")?.takeIf { it.isNotBlank() } ?: "${rootDir}/my-upload-key.jks"
       val releaseKeystore = file(keystorePath)
-      if (releaseKeystore.exists()) {
+      if (releaseKeystore.isFile) {
         storeFile = releaseKeystore
         storePassword = System.getenv("STORE_PASSWORD")
-        keyAlias = "upload"
+        keyAlias = System.getenv("KEY_ALIAS") ?: "upload"
         keyPassword = System.getenv("KEY_PASSWORD")
       } else {
         storeFile = file("${rootDir}/debug.keystore")
@@ -158,6 +162,8 @@ dependencies {
   testImplementation(libs.androidx.junit)
   testImplementation(libs.junit)
   testImplementation(libs.kotlinx.coroutines.test)
+  // Real org.json for plain JVM tests (android.jar only ships stubs)
+  testImplementation(libs.org.json)
   testImplementation(libs.robolectric)
   testImplementation(libs.roborazzi)
   testImplementation(libs.roborazzi.compose)

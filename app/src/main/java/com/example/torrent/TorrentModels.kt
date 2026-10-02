@@ -9,7 +9,7 @@ enum class TorrentState(val displayTurkish: String) {
     CONNECTING_TRACKERS("İzleyicilere bağlanılıyor..."),
     RESOLVING_METADATA("Magnet meta verisi çözümleniyor..."),
     DOWNLOADING("İndiriliyor"),
-    TRANSFERRING("Cihaz depolamasına aktarılıyor..."),
+    TRANSFERRING("Dosya hazırlanıyor..."),
     PAUSED("Duraklatıldı"),
     COMPLETED("İndirme tamamlandı"),
     ERROR("Hata")
@@ -31,9 +31,20 @@ enum class TorrentErrorType(val code: String, val displayTurkish: String) {
     UNKNOWN("UNKNOWN", "Bilinmeyen torrent hatası")
 }
 
+/** One file inside a torrent. Padding files of hybrid v1/v2 torrents are never listed. */
+data class TorrentFileEntry(
+    val index: Int,
+    val path: String,
+    val sizeBytes: Long,
+    val isVideo: Boolean
+) {
+    val displayName: String get() = path.substringAfterLast('/')
+}
+
 data class TorrentDownloadInfo(
     val magnetUri: String = "",
     val torrentName: String = "Torrent İndirmesi",
+    val sourceLabel: String = "",
     val infoHashHex: String = "",
     val state: TorrentState = TorrentState.IDLE,
     val statusMessage: String = "",
@@ -47,15 +58,32 @@ data class TorrentDownloadInfo(
     val seeders: Int = 0,
     val leechers: Int = 0,
     val connectedPeers: Int = 0,
+    val dhtNodes: Long = 0L,
     val pieceCount: Int = 0,
     val pieceSize: Int = 0,
-    val files: List<String> = emptyList(),
+    val files: List<TorrentFileEntry> = emptyList(),
     val selectedVideoFileName: String = "",
+    val awaitingFileSelection: Boolean = false,
     val downloadedFile: File? = null,
+    /** Gallery (MediaStore) copy, set only after the user chooses to save one. */
     val permanentUri: Uri? = null,
+    val isSavingToGallery: Boolean = false,
+    val gallerySaveProgress: Float = 0f,
+    val galleryError: String? = null,
+    val canRetry: Boolean = false,
     val errorMessage: String? = null,
     val errorType: TorrentErrorType? = null
 ) {
+    val isActive: Boolean
+        get() = state == TorrentState.RESOLVING_METADATA ||
+                state == TorrentState.CONNECTING_TRACKERS ||
+                state == TorrentState.DOWNLOADING ||
+                state == TorrentState.PAUSED ||
+                state == TorrentState.TRANSFERRING
+
+    val selectedFile: TorrentFileEntry?
+        get() = files.firstOrNull { it.path == selectedVideoFileName }
+
     fun formatDownloadedSize(): String {
         return "${formatBytes(downloadedBytes)} / ${if (totalBytes > 0) formatBytes(totalBytes) else "Hesaplanıyor..."}"
     }
