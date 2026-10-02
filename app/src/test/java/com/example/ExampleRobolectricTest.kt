@@ -26,5 +26,31 @@ class ExampleRobolectricTest {
     viewModel.openEncodeDialog()
     assertEquals(true, viewModel.uiState.value.showEncodeDialog)
   }
+
+  @Test
+  fun `test undo redo stack and cue manipulation`() {
+    val context = ApplicationProvider.getApplicationContext<android.app.Application>()
+    val viewModel = com.example.ui.AxiSubViewModel(context)
+    val initialCount = viewModel.uiState.value.subtitles.size
+
+    // Add cue
+    viewModel.addNewCueAtCurrentPosition()
+    assertEquals(initialCount + 1, viewModel.uiState.value.subtitles.size)
+    assertEquals(true, viewModel.uiState.value.canUndo)
+
+    // Undo addition
+    viewModel.undo()
+    assertEquals(initialCount, viewModel.uiState.value.subtitles.size)
+    assertEquals(true, viewModel.uiState.value.canRedo)
+
+    // Redo addition
+    viewModel.redo()
+    assertEquals(initialCount + 1, viewModel.uiState.value.subtitles.size)
+
+    // Test duplicate
+    val lastCue = viewModel.uiState.value.subtitles.last()
+    viewModel.duplicateCue(lastCue)
+    assertEquals(initialCount + 2, viewModel.uiState.value.subtitles.size)
+  }
 }
 

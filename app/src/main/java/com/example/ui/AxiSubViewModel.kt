@@ -77,13 +77,156 @@ data class AxiSubUiState(
     val introVideoHeight: Int = 0,
     val introVideoFps: Double = 30.0,
     val introKeepAudio: Boolean = false,
-    val showIntroPreview: Boolean = false
+    val showIntroPreview: Boolean = false,
+    val canUndo: Boolean = false,
+    val canRedo: Boolean = false,
+    val selectedCueId: Int? = null
 )
 
 class AxiSubViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _uiState = MutableStateFlow(AxiSubUiState())
     val uiState: StateFlow<AxiSubUiState> = _uiState.asStateFlow()
+
+    private val undoStack = java.util.ArrayDeque<List<SubtitleCue>>()
+    private val redoStack = java.util.ArrayDeque<List<SubtitleCue>>()
+
+    private fun pushUndoState(cues: List<SubtitleCue>) {
+        if (undoStack.size >= 50) {
+            undoStack.removeLast()
+        }
+        undoStack.push(cues)
+        redoStack.clear()
+        _uiState.update { it.copy(canUndo = true, canRedo = false) }
+    }
+
+    fun undo() {
+        if (undoStack.isEmpty()) return
+        val current = _uiState.value.subtitles
+        val previous = undoStack.pop()
+        redoStack.push(current)
+        _uiState.update { state ->
+            state.copy(
+                subtitles = previous,
+                generatedAssContent = generateAssString(previous, state.subtitleStyle, state.subtitleFileName),
+                canUndo = undoStack.isNotEmpty(),
+                canRedo = true,
+                statusMessage = "İşlem geri alındı"
+            )
+        }
+        updateActiveCues(_uiState.value.currentPositionMs)
+    }
+
+    fun redo() {
+        if (redoStack.isEmpty()) return
+        val current = _uiState.value.subtitles
+        val next = redoStack.pop()
+        undoStack.push(current)
+        _uiState.update { state ->
+            state.copy(
+                subtitles = next,
+                generatedAssContent = generateAssString(next, state.subtitleStyle, state.subtitleFileName),
+                canUndo = true,
+                canRedo = redoStack.isNotEmpty(),
+                statusMessage = "İşlem yinelendi"
+            )
+        }
+        updateActiveCues(_uiState.value.currentPositionMs)
+    }
+
+    fun selectCue(cueId: Int?) {
+        _uiState.update { it.copy(selectedCueId = cueId) }
+    }
+
+    fun duplicateCue(cue: SubtitleCue) {
+        val current = _uiState.value.subtitles
+        pushUndoState(current)
+        val maxId = current.maxOfOrNull { it.id } ?: 0
+        val newCue = cue.copy(
+            id = maxId + 1,
+            startTimeMs = cue.endTimeMs + 50L,
+            endTimeMs = cue.endTimeMs + 50L + (cue.endTimeMs - cue.startTimeMs).coerceAtLeast(1000L)
+        )
+        val updated = (current + newCue).sortedBy { it.startTimeMs }
+        _uiState.update { state ->
+            state.copy(
+                subtitles = updated,
+                selectedCueId = newCue.id,
+                generatedAssContent = generateAssString(updated, state.subtitleStyle, state.subtitleFileName),
+                statusMessage = "Altyazı kopyalandı (#${newCue.id})"
+            )
+        }
+        updateActiveCues(_uiState.value.currentPositionMs)
+    }
+
+    fun splitCue(cue: SubtitleCue) {
+        val current = _uiState.value.subtitles
+        val duration = cue.endTimeMs - cue.startTimeMs
+        if (duration < 500L) {
+            _uiState.update { it.copy(statusMessage = "Altyazı süresi bölmek için çok kısa") }
+            return
+        }
+        pushUndoState(current)
+        val midTime = cue.startTimeMs + (duration / 2)
+        val maxId = current.maxOfOrNull { it.id } ?: 0
+
+        val words = cue.rawText.split(" ")
+        val (firstPart, secondPart) = if (words.size >= 2) {
+            val half = words.size / 2
+            Pair(words.take(half).joinToString(" "), words.drop(half).joinToString(" "))
+        } else {
+            Pair(cue.rawText, cue.rawText)
+        }
+
+        val firstCue = cue.copy(
+            endTimeMs = midTime,
+            rawText = firstPart,
+            cleanText = com.example.parser.HtmlSubtitleParser.cleanToPlainText(firstPart)
+        )
+        val secondCue = cue.copy(
+            id = maxId + 1,
+            startTimeMs = midTime + 50L,
+            rawText = secondPart,
+            cleanText = com.example.parser.HtmlSubtitleParser.cleanToPlainText(secondPart)
+        )
+
+        val updated = current.map { if (it.id == cue.id) firstCue else it } + secondCue
+        val sorted = updated.sortedBy { it.startTimeMs }
+        _uiState.update { state ->
+            state.copy(
+                subtitles = sorted,
+                selectedCueId = firstCue.id,
+                generatedAssContent = generateAssString(sorted, state.subtitleStyle, state.subtitleFileName),
+                statusMessage = "Altyazı bölündü"
+            )
+        }
+        updateActiveCues(_uiState.value.currentPositionMs)
+    }
+
+    fun replaceTextInAllCues(target: String, replacement: String) {
+        if (target.isEmpty()) return
+        val current = _uiState.value.subtitles
+        pushUndoState(current)
+        var count = 0
+        val updated = current.map { cue ->
+            if (cue.rawText.contains(target, ignoreCase = false)) {
+                count++
+                val newRaw = cue.rawText.replace(target, replacement)
+                cue.copy(
+                    rawText = newRaw,
+                    cleanText = com.example.parser.HtmlSubtitleParser.cleanToPlainText(newRaw)
+                )
+            } else cue
+        }
+        _uiState.update { state ->
+            state.copy(
+                subtitles = updated,
+                generatedAssContent = generateAssString(updated, state.subtitleStyle, state.subtitleFileName),
+                statusMessage = "$count satırda değiştirildi"
+            )
+        }
+        updateActiveCues(_uiState.value.currentPositionMs)
+    }
 
     // Event to signal player to seek to timestamp
     private val _seekEvent = MutableSharedFlow<Long>(extraBufferCapacity = 1)
@@ -423,12 +566,14 @@ class AxiSubViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun saveEditedCue(updatedCue: SubtitleCue) {
+        pushUndoState(_uiState.value.subtitles)
         _uiState.update { state ->
             val updatedList = state.subtitles.map { if (it.id == updatedCue.id) updatedCue else it }
                 .sortedBy { it.startTimeMs }
             state.copy(
                 subtitles = updatedList,
                 editingCue = null,
+                selectedCueId = updatedCue.id,
                 generatedAssContent = generateAssString(updatedList, state.subtitleStyle, state.subtitleFileName),
                 statusMessage = "Altyazı #${updatedCue.id} güncellendi"
             )
@@ -438,6 +583,7 @@ class AxiSubViewModel(application: Application) : AndroidViewModel(application) 
 
     fun addNewCueAtCurrentPosition() {
         val currentPos = _uiState.value.currentPositionMs
+        pushUndoState(_uiState.value.subtitles)
         val nextId = (_uiState.value.subtitles.maxOfOrNull { it.id } ?: 0) + 1
         val newCue = SubtitleCue(
             id = nextId,
@@ -450,7 +596,8 @@ class AxiSubViewModel(application: Application) : AndroidViewModel(application) 
             val updated = (state.subtitles + newCue).sortedBy { it.startTimeMs }
             state.copy(
                 subtitles = updated,
-                editingCue = newCue,
+                editingCue = null,
+                selectedCueId = newCue.id,
                 generatedAssContent = generateAssString(updated, state.subtitleStyle, state.subtitleFileName),
                 statusMessage = "Yeni altyazı eklendi (#$nextId)"
             )
@@ -459,11 +606,13 @@ class AxiSubViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun deleteCue(cueId: Int) {
+        pushUndoState(_uiState.value.subtitles)
         _uiState.update { state ->
             val updated = state.subtitles.filterNot { it.id == cueId }
             state.copy(
                 subtitles = updated,
                 editingCue = null,
+                selectedCueId = if (state.selectedCueId == cueId) null else state.selectedCueId,
                 generatedAssContent = generateAssString(updated, state.subtitleStyle, state.subtitleFileName),
                 statusMessage = "Altyazı #$cueId silindi"
             )

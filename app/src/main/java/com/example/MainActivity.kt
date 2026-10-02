@@ -77,6 +77,7 @@ import com.example.ui.components.HardsubEncodeDialog
 import com.example.ui.components.MainMenuScreen
 import com.example.ui.components.MkvSubtitleExtractionDialog
 import com.example.ui.components.SubtitleListSection
+import com.example.ui.components.ModernSubtitleEditorScreen
 import com.example.ui.components.VideoInfoSection
 import com.example.ui.components.VideoPlayerSection
 import com.example.ui.theme.MyApplicationTheme
@@ -237,222 +238,43 @@ fun AxiSubMainScreen(
             }
         )
     } else {
-        // 2. Subtitle Editor Screen
+        // 2. Redesigned Modern Subtitle Editor Screen
         BackHandler {
             viewModel.navigateToMainMenu()
         }
 
-        Scaffold(
-            contentWindowInsets = WindowInsets.safeDrawing,
-            snackbarHost = { SnackbarHost(snackbarHostState) },
-            topBar = {
-                if (!uiState.isFullscreen) {
-                    TopAppBar(
-                        navigationIcon = {
-                            IconButton(
-                                onClick = viewModel::navigateToMainMenu,
-                                modifier = Modifier.testTag("nav_back_to_menu")
-                            ) {
-                                Icon(
-                                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                                    contentDescription = "Ana Menüye Dön"
-                                )
-                            }
-                        },
-                        title = {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Image(
-                                    painter = painterResource(id = R.drawable.ic_rem_logo),
-                                    contentDescription = "Rem Logo",
-                                    contentScale = ContentScale.Crop,
-                                    modifier = Modifier
-                                        .size(32.dp)
-                                        .clip(CircleShape)
-                                )
-                                Spacer(modifier = Modifier.width(10.dp))
-                                Column {
-                                    Text(
-                                        text = "remsubs playground",
-                                        fontWeight = FontWeight.Bold,
-                                        fontSize = 17.sp
-                                    )
-                                    Text(
-                                        text = uiState.subtitleFileName ?: ".ass düzenleyici",
-                                        fontSize = 11.sp,
-                                        color = MaterialTheme.colorScheme.primary,
-                                        fontWeight = FontWeight.SemiBold
-                                    )
-                                }
-                            }
-                        },
-                        actions = {
-                            // "Encode Yap" Action Button (Hardsub Burn-in libass & CRF 23)
-                            Button(
-                                onClick = { viewModel.openEncodeDialog() },
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = MaterialTheme.colorScheme.primary
-                                ),
-                                shape = RoundedCornerShape(10.dp),
-                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                                modifier = Modifier
-                                    .padding(end = 4.dp)
-                                    .testTag("top_bar_btn_encode")
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Movie,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text(
-                                    text = "Encode Al",
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
-
-                            // Quick .ASS Export Button in TopAppBar
-                            FilledTonalButton(
-                                onClick = { viewModel.openExportDialog() },
-                                shape = RoundedCornerShape(10.dp),
-                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                                modifier = Modifier
-                                    .padding(end = 4.dp)
-                                    .testTag("top_bar_export_ass")
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.FileDownload,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text(
-                                    text = ".ASS Çıktı",
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
-
-                            // Quick Video Pick button in top bar
-                            IconButton(
-                                onClick = { videoPickerLauncher.launch("video/*") },
-                                modifier = Modifier.testTag("top_bar_pick_video")
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.VideoFile,
-                                    contentDescription = "Video Seç",
-                                    tint = MaterialTheme.colorScheme.primary
-                                )
-                            }
-                        },
-                        colors = TopAppBarDefaults.topAppBarColors(
-                            containerColor = MaterialTheme.colorScheme.surface
-                        )
-                    )
-                }
-            }
-        ) { innerPadding ->
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(innerPadding)
-                    .background(MaterialTheme.colorScheme.background)
-            ) {
-                // Video Player & Subtitle Overlay Area
-                VideoPlayerSection(
-                    uiState = uiState,
-                    seekEvent = viewModel.seekEvent,
-                    onUpdatePosition = viewModel::updatePlaybackPosition,
-                    onUpdateDuration = viewModel::updateDuration,
-                    onSetPlaying = viewModel::setIsPlaying,
-                    onSeekTo = viewModel::seekTo,
-                    onSetSpeed = viewModel::setPlaybackSpeed,
-                    onToggleFullscreen = viewModel::toggleFullscreen,
-                    onPlayerError = viewModel::setErrorMessage,
-                    onEditActiveCue = viewModel::startEditingCue,
-                    onVideoDimensionsDetected = viewModel::updateVideoDimensions,
-                    modifier = if (uiState.isFullscreen) Modifier.weight(1f) else Modifier
-                )
-
-                // When in fullscreen mode, we only show video player
-                if (!uiState.isFullscreen) {
-                    // Navigation Tabs (Altyazılar, Font & Konum, Video & Bilgi)
-                    TabRow(
-                        selectedTabIndex = uiState.selectedTab,
-                        containerColor = MaterialTheme.colorScheme.surface,
-                        contentColor = MaterialTheme.colorScheme.primary,
-                        indicator = { tabPositions ->
-                            TabRowDefaults.SecondaryIndicator(
-                                Modifier.tabIndicatorOffset(tabPositions[uiState.selectedTab]),
-                                color = MaterialTheme.colorScheme.primary
-                            )
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Tab(
-                            selected = uiState.selectedTab == 0,
-                            onClick = { viewModel.setSelectedTab(0) },
-                            icon = { Icon(Icons.Default.Subtitles, null, modifier = Modifier.size(20.dp)) },
-                            text = { Text("Altyazılar", fontSize = 12.sp) },
-                            modifier = Modifier.testTag("tab_subtitles")
-                        )
-
-                        Tab(
-                            selected = uiState.selectedTab == 1,
-                            onClick = { viewModel.setSelectedTab(1) },
-                            icon = { Icon(Icons.Default.FontDownload, null, modifier = Modifier.size(20.dp)) },
-                            text = { Text("Font & Stil (.ttf)", fontSize = 12.sp) },
-                            modifier = Modifier.testTag("tab_font_style")
-                        )
-
-                        Tab(
-                            selected = uiState.selectedTab == 2,
-                            onClick = { viewModel.setSelectedTab(2) },
-                            icon = { Icon(Icons.Default.Info, null, modifier = Modifier.size(20.dp)) },
-                            text = { Text("Video & Bilgi", fontSize = 12.sp) },
-                            modifier = Modifier.testTag("tab_video_info")
-                        )
-                    }
-
-                    // Bottom Section according to selected tab
-                    Box(modifier = Modifier.weight(1f)) {
-                        when (uiState.selectedTab) {
-                            0 -> SubtitleListSection(
-                                uiState = uiState,
-                                onPickSubtitle = {
-                                    subtitlePickerLauncher.launch(arrayOf("*/*"))
-                                },
-                                onLoadDemoSubtitle = viewModel::loadDemoMedia,
-                                onSeekToCue = viewModel::seekTo,
-                                onAdjustTimeOffset = viewModel::adjustTimeOffset,
-                                onResetTimeOffset = viewModel::resetTimeOffset,
-                                onSearchQueryChange = viewModel::setSearchQuery,
-                                onEditCue = viewModel::startEditingCue,
-                                onAddNewCue = viewModel::addNewCueAtCurrentPosition,
-                                onExportAss = viewModel::openExportDialog
-                            )
-                            1 -> FontAndStyleSection(
-                                uiState = uiState,
-                                onPickTtfFont = {
-                                    fontPickerLauncher.launch(arrayOf("*/*"))
-                                },
-                                onSelectPresetFont = viewModel::selectPresetFont,
-                                onUpdateStyle = viewModel::updateStyle,
-                                onExportAss = viewModel::openExportDialog
-                            )
-                            2 -> VideoInfoSection(
-                                uiState = uiState,
-                                onPickVideo = {
-                                    videoPickerLauncher.launch("video/*")
-                                },
-                                onLoadDemoMedia = viewModel::loadDemoMedia,
-                                onOpenEncode = viewModel::openEncodeDialog
-                            )
-                        }
-                    }
-                }
-            }
-        }
+        ModernSubtitleEditorScreen(
+            uiState = uiState,
+            seekEvent = viewModel.seekEvent,
+            onNavigateBack = viewModel::navigateToMainMenu,
+            onUpdatePosition = viewModel::updatePlaybackPosition,
+            onUpdateDuration = viewModel::updateDuration,
+            onSetPlaying = viewModel::setIsPlaying,
+            onSeekTo = viewModel::seekTo,
+            onSetSpeed = viewModel::setPlaybackSpeed,
+            onToggleFullscreen = viewModel::toggleFullscreen,
+            onSaveCue = viewModel::saveEditedCue,
+            onAddNewCue = viewModel::addNewCueAtCurrentPosition,
+            onDeleteCue = viewModel::deleteCue,
+            onSelectCue = viewModel::selectCue,
+            onDuplicateCue = viewModel::duplicateCue,
+            onSplitCue = viewModel::splitCue,
+            onAdjustTimeOffset = viewModel::adjustTimeOffset,
+            onResetTimeOffset = viewModel::resetTimeOffset,
+            onUpdateStyle = viewModel::updateStyle,
+            onPickTtfFont = { fontPickerLauncher.launch(arrayOf("*/*")) },
+            onSelectPresetFont = viewModel::selectPresetFont,
+            onOpenExportDialog = viewModel::openExportDialog,
+            onOpenEncodeDialog = viewModel::openEncodeDialog,
+            onPickVideo = { videoPickerLauncher.launch("video/*") },
+            onPickSubtitle = { subtitlePickerLauncher.launch(arrayOf("*/*")) },
+            onExtractMkvSubtitle = { mkvVideoPickerLauncher.launch(arrayOf("video/*", "video/x-matroska", "*/*")) },
+            onUndo = viewModel::undo,
+            onRedo = viewModel::redo,
+            onReplaceAllText = viewModel::replaceTextInAllCues,
+            onVideoDimensionsDetected = viewModel::updateVideoDimensions,
+            snackbarHostState = snackbarHostState
+        )
     }
 
     // Subtitle Cue Edit Dialog / BottomSheet (Edit timing, text & custom positioning)

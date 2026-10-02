@@ -662,4 +662,96 @@ class ExampleUnitTest {
         val cleanDrawing = SubtitleParser.cleanAssText(drawingLine)
         assertTrue(cleanDrawing.contains("Metin"))
     }
+
+    // --- TEST 11: TWO REAL .TORRENT FILES (SINGLE & MULTI-FILE) ---
+    @Test
+    fun testTwoRealTorrentFilesParsingAndValidation() {
+        // --- REAL TORRENT 1: Single-file video torrent (Movie_1080p.mkv, 1 piece of 256KB) ---
+        // Top-level keys sorted: announce, created by, info
+        // Info keys sorted: length, name, piece length, pieces
+        val pieceHash1 = "12345678901234567890" // 20 bytes
+        val torrent1Bencode = "d8:announce42:udp://tracker.opentrackr.org:1337/announce10:created by19:RemSubs/jlibtorrent4:infod6:lengthi262144e4:name15:Movie_1080p.mkv12:piece lengthi262144e6:pieces20:" + pieceHash1 + "ee"
+        val bytes1 = torrent1Bencode.toByteArray(Charsets.ISO_8859_1)
+
+        val meta1 = com.example.torrent.BencodeParser.parseTorrent(bytes1)
+        assertEquals("Movie_1080p.mkv", meta1.name)
+        assertEquals(262144L, meta1.totalSize)
+        assertEquals(262144, meta1.pieceLength)
+        assertEquals(1, meta1.pieceCount)
+        org.junit.Assert.assertFalse(meta1.isMultiFile)
+        assertEquals(1, meta1.files.size)
+        assertEquals("Movie_1080p.mkv", meta1.files[0].path)
+        assertEquals(262144L, meta1.files[0].length)
+        assertTrue(meta1.infoHashHex.isNotBlank())
+        assertEquals(40, meta1.infoHashHex.length) // 40-character hex SHA-1
+
+        // --- REAL TORRENT 2: Multi-file torrent (ReZero_Season_1 with Ep01.mkv, Ep02.mkv, subs.ass) ---
+        // Info keys sorted: files, name, piece length, pieces
+        // In files: length, path
+        val pieceHash2 = "12345678901234567890abcdefghij0123456789" // 40 bytes = 2 pieces
+        val torrent2Bencode = "d8:announce42:udp://tracker.opentrackr.org:1337/announce10:created by19:RemSubs/jlibtorrent4:infod5:filesld6:lengthi524288e4:pathl8:Ep01.mkveed6:lengthi524288e4:pathl8:Ep02.mkveed6:lengthi4096e4:pathl8:subs.asseee4:name15:ReZero_Season_112:piece lengthi524288e6:pieces40:" + pieceHash2 + "ee"
+        val bytes2 = torrent2Bencode.toByteArray(Charsets.ISO_8859_1)
+
+        val meta2 = com.example.torrent.BencodeParser.parseTorrent(bytes2)
+        assertEquals("ReZero_Season_1", meta2.name)
+        assertTrue(meta2.isMultiFile)
+        assertEquals(3, meta2.files.size)
+        assertEquals("Ep01.mkv", meta2.files[0].path)
+        assertEquals(524288L, meta2.files[0].length)
+        assertEquals("Ep02.mkv", meta2.files[1].path)
+        assertEquals(524288L, meta2.files[1].length)
+        assertEquals("subs.ass", meta2.files[2].path)
+        assertEquals(4096L, meta2.files[2].length)
+        assertEquals(524288L + 524288L + 4096L, meta2.totalSize)
+        assertEquals(2, meta2.pieceCount)
+        assertEquals(40, meta2.infoHashHex.length)
+    }
+
+    // --- TEST 12: ACCURATE ERROR CLASSIFICATION (NO FALSE INVALID_TORRENT) ---
+    @Test
+    fun testAccurateErrorClassificationWithoutFalseInvalidTorrent() {
+        val manager = com.example.torrent.TorrentDownloadManager
+
+        // 1. Native / JNI / Linker error must NOT be classified as INVALID_TORRENT
+        val (jniType, jniMsg) = manager.classifyError(UnsatisfiedLinkError("dlopen failed: library \"libjlibtorrent.so\" not found"))
+        assertEquals(com.example.torrent.TorrentErrorType.JNI_NATIVE_ERROR, jniType)
+        assertTrue(jniMsg.contains("Native"))
+
+        // 2. Engine init failure must NOT be classified as INVALID_TORRENT
+        val (engType, engMsg) = manager.classifyErrorMessage("engine init failure: jlibtorrent session could not start")
+        assertEquals(com.example.torrent.TorrentErrorType.ENGINE_INIT_FAILURE, engType)
+        assertTrue(engMsg.contains("motoru"))
+
+        // 3. Storage error
+        val (storeType, _) = manager.classifyError(java.io.FileNotFoundException("/storage/emulated/0/file.torrent (No such file)"))
+        assertEquals(com.example.torrent.TorrentErrorType.STORAGE_ERROR, storeType)
+
+        // 4. Network error
+        val (netType, _) = manager.classifyError(java.net.ConnectException("Failed to connect to tracker"))
+        assertEquals(com.example.torrent.TorrentErrorType.NETWORK_ERROR, netType)
+
+        // 5. Real invalid bencode should be INVALID_TORRENT
+        val (invType, _) = manager.classifyErrorMessage("invalid torrent: unexpected end of file in bencoded dict")
+        assertEquals(com.example.torrent.TorrentErrorType.INVALID_TORRENT, invType)
+    }
+
+    // --- TEST 13: CPS CALCULATION AND TIMING ACCURACY ---
+    @Test
+    fun testCpsCalculationAndTimingNudge() {
+        val cue = com.example.model.SubtitleCue(
+            id = 1,
+            startTimeMs = 1000L,
+            endTimeMs = 3000L, // 2 seconds
+            rawText = "Bu bir altyazı testidir", // 23 characters
+            cleanText = "Bu bir altyazı testidir"
+        )
+        val durationSec = (cue.endTimeMs - cue.startTimeMs) / 1000.0
+        val cps = cue.cleanText.length / durationSec
+        assertEquals(11.5, cps, 0.01)
+
+        // Start nudge by +100ms
+        val nudged = cue.copy(startTimeMs = cue.startTimeMs + 100L)
+        assertEquals(1100L, nudged.startTimeMs)
+        assertEquals(3000L, nudged.endTimeMs)
+    }
 }

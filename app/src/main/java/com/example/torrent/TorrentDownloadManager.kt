@@ -147,33 +147,80 @@ object TorrentDownloadManager {
         val msg = message ?: ""
         val lower = msg.lowercase(Locale.ROOT)
         return when {
-            lower.contains("timeout") || lower.contains("metadata") ->
-                Pair(TorrentErrorType.METADATA_TIMEOUT, "Metadata zaman aşımı (Tracker/Peer yanıt vermedi)")
-            lower.contains("no peer") || lower.contains("zero peers") ->
-                Pair(TorrentErrorType.NO_PEERS, "Kullanılabilir eş (peer) veya seeder bulunamadı")
-            lower.contains("tracker") ->
-                Pair(TorrentErrorType.TRACKER_ERROR, "İzleyici (Tracker) bağlantı hatası")
-            lower.contains("dht") ->
-                Pair(TorrentErrorType.DHT_ERROR, "DHT ağı yanıt vermedi")
-            lower.contains("permission") || lower.contains("denied") ->
-                Pair(TorrentErrorType.PERMISSION, "Depolama yazma izni reddedildi")
-            lower.contains("space") || lower.contains("full") ->
+            // 1. Native / JNI / ABI Linker errors
+            lower.contains("unsatisfiedlink") || lower.contains("dlopen") || lower.contains("jlibtorrent.so") ||
+            lower.contains(".so\" not found") || lower.contains("linkageerror") || lower.contains("noclassdef") ->
+                Pair(TorrentErrorType.JNI_NATIVE_ERROR, "Native kütüphane (libjlibtorrent.so) hatası: ${msg.ifBlank { "ABI uyumsuzluğu veya JNI yükleme hatası" }}")
+
+            // 2. Engine initialization failure
+            lower.contains("engine init") || lower.contains("session could not start") ||
+            (lower.contains("sessionmanager") && lower.contains("failed")) || lower.contains("engine failure") ->
+                Pair(TorrentErrorType.ENGINE_INIT_FAILURE, "BitTorrent motoru başlatılamadı: ${msg.ifBlank { "SessionManager başlatılamadı" }}")
+
+            // 3. Storage and permissions
+            lower.contains("permission") || lower.contains("denied") || lower.contains("securityexception") ->
+                Pair(TorrentErrorType.PERMISSION, "Depolama izni reddedildi: $msg")
+
+            lower.contains("no space") || (lower.contains("space") && lower.contains("full")) || lower.contains("disk full") ->
                 Pair(TorrentErrorType.STORAGE_FULL, "Cihaz depolama alanı yetersiz")
-            lower.contains("magnet") ->
+
+            lower.contains("filenotfound") || lower.contains("ioexception") || lower.contains("read error") || lower.contains("write error") ->
+                Pair(TorrentErrorType.STORAGE_ERROR, "Depolama veya dosya I/O hatası: $msg")
+
+            // 4. Network and socket
+            lower.contains("connection refused") || lower.contains("network unreachable") ||
+            (lower.contains("timed out") && lower.contains("socket")) || lower.contains("unknownhost") ||
+            lower.contains("connection reset") || lower.contains("econnreset") || lower.contains("econnrefused") ->
+                Pair(TorrentErrorType.NETWORK_ERROR, "Ağ bağlantı hatası: $msg")
+
+            // 5. Metadata timeout
+            lower.contains("metadata") || lower.contains("meta verisi") ->
+                Pair(TorrentErrorType.METADATA_TIMEOUT, "Metadata zaman aşımı (Tracker/Peer yanıt vermedi)")
+
+            // 6. Peers
+            lower.contains("no peer") || lower.contains("zero peer") || lower.contains("no seeder") || lower.contains("zero seed") ->
+                Pair(TorrentErrorType.NO_PEERS, "Kullanılabilir eş (peer) veya seeder bulunamadı")
+
+            // 7. Trackers
+            lower.contains("tracker") ->
+                Pair(TorrentErrorType.TRACKER_ERROR, "İzleyici (Tracker) bağlantı hatası: $msg")
+
+            // 8. DHT
+            lower.contains("dht") ->
+                Pair(TorrentErrorType.DHT_ERROR, "DHT ağı yanıt vermedi: $msg")
+
+            // 9. Magnet validation
+            lower.contains("invalid magnet") || lower.contains("geçersiz magnet") || (lower.contains("magnet:") && lower.contains("invalid")) ->
                 Pair(TorrentErrorType.INVALID_MAGNET, "Geçersiz veya desteklenmeyen Magnet URI")
-            lower.contains("torrent") || lower.contains("bencode") || lower.contains("invalid") ->
-                Pair(TorrentErrorType.INVALID_TORRENT, "Geçersiz veya bozuk .torrent dosyası")
-            lower.contains("engine") ->
-                Pair(TorrentErrorType.ENGINE_INIT_FAILURE, "BitTorrent motoru başlatılamadı")
-            lower.contains("network") || lower.contains("connect") ->
-                Pair(TorrentErrorType.NETWORK_ERROR, "Ağ bağlantısı hatası")
+
+            // 10. Actual .torrent content errors (bencode corruption, truncated file, invalid structure)
+            lower.contains("bencode") || lower.contains("invalid torrent") || lower.contains("bozuk torrent") ||
+            lower.contains("unexpected end of file") || lower.contains("not a valid bencode") || lower.contains("torrent file is corrupt") ->
+                Pair(TorrentErrorType.INVALID_TORRENT, "Geçersiz veya bozuk .torrent içeriği: ${msg.ifBlank { "Bencode yapısı çözümlenemedi" }}")
+
+            // 11. Generic fallback - preserve the real message
             else ->
                 Pair(TorrentErrorType.UNKNOWN, msg.ifBlank { "Bilinmeyen indirme hatası" })
         }
     }
 
     fun classifyError(t: Throwable): Pair<TorrentErrorType, String> {
-        return classifyErrorMessage(t.localizedMessage ?: t.message)
+        val rawMsg = t.localizedMessage ?: t.message ?: t.javaClass.simpleName
+        return when {
+            t is UnsatisfiedLinkError || t is LinkageError || t is NoClassDefFoundError -> {
+                Pair(TorrentErrorType.JNI_NATIVE_ERROR, "Native (JNI/libtorrent) kütüphane hatası: $rawMsg")
+            }
+            t is java.io.FileNotFoundException -> {
+                Pair(TorrentErrorType.STORAGE_ERROR, "Dosya bulunamadı: $rawMsg")
+            }
+            t is java.net.SocketException || t is java.net.UnknownHostException || t is java.net.ConnectException -> {
+                Pair(TorrentErrorType.NETWORK_ERROR, "Ağ veya bağlantı hatası: $rawMsg")
+            }
+            t is SecurityException -> {
+                Pair(TorrentErrorType.PERMISSION, "Depolama veya dosya erişim izni reddedildi: $rawMsg")
+            }
+            else -> classifyErrorMessage(rawMsg)
+        }
     }
 
     /**
@@ -254,42 +301,60 @@ object TorrentDownloadManager {
         logTorrentSnapshot(stateOverride = TorrentState.RESOLVING_METADATA.name)
 
         scope.launch(Dispatchers.IO) {
+            val tempFile = File(context.cacheDir, "picked_torrent_${System.currentTimeMillis()}.torrent")
             try {
-                val bytes = context.contentResolver.openInputStream(torrentUri)?.use { it.readBytes() }
+                val bytes = try {
+                    context.contentResolver.openInputStream(torrentUri)?.use { input ->
+                        tempFile.outputStream().use { output ->
+                            input.copyTo(output)
+                        }
+                    }
+                    if (tempFile.exists() && tempFile.length() > 0) {
+                        tempFile.readBytes()
+                    } else {
+                        null
+                    }
+                } catch (ioe: Throwable) {
+                    Log.e(TAG, "ContentResolver reading failed: ${ioe.localizedMessage}", ioe)
+                    throw ioe
+                }
 
                 if (bytes == null || bytes.isEmpty()) {
-                    val errPair = Pair(TorrentErrorType.INVALID_TORRENT, ".torrent dosyası okunamadı veya boş.")
-                    _downloadInfo.update {
-                        it.copy(
-                            state = TorrentState.ERROR,
-                            errorMessage = errPair.second,
-                            errorType = errPair.first,
-                            statusMessage = errPair.second
-                        )
+                    throw java.io.IOException("Seçilen .torrent dosyası boş veya okunamadı.")
+                }
+
+                if (bytes.size >= 5) {
+                    val head = String(bytes.take(20).toByteArray(), Charsets.ISO_8859_1).lowercase(Locale.ROOT)
+                    if (head.startsWith("<!doc") || head.startsWith("<html")) {
+                        throw IllegalArgumentException("Seçilen dosya .torrent değil, web sayfası (HTML). Torrent dosyasını web tarayıcısında doğrudan indirip tekrar seçin.")
                     }
-                    logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errPair.second)
-                    return@launch
                 }
 
                 if (!ensureSessionStarted()) {
-                    throw IllegalStateException("engine init failure: jlibtorrent session could not start")
+                    throw IllegalStateException("BitTorrent motoru başlatılamadı (jlibtorrent session could not start)")
                 }
-                val sm = sessionManager ?: throw IllegalStateException("engine init failure")
+                val sm = sessionManager ?: throw IllegalStateException("BitTorrent motoru hazır değil")
 
-                val ti = try {
-                    TorrentInfo(bytes)
-                } catch (e: Exception) {
-                    val errPair = Pair(TorrentErrorType.INVALID_TORRENT, "Geçersiz .torrent dosyası: ${e.localizedMessage}")
-                    _downloadInfo.update {
-                        it.copy(
-                            state = TorrentState.ERROR,
-                            errorMessage = errPair.second,
-                            errorType = errPair.first,
-                            statusMessage = errPair.second
-                        )
+                Log.i(TAG, "Parsing TorrentInfo from temp file (${tempFile.length()} bytes)...")
+                val ti: TorrentInfo = try {
+                    TorrentInfo(tempFile)
+                } catch (tFile: Throwable) {
+                    Log.w(TAG, "TorrentInfo(File) threw ${tFile.javaClass.name}: ${tFile.message}. Falling back to TorrentInfo.bdecode(bytes)...")
+                    try {
+                        TorrentInfo.bdecode(bytes)
+                    } catch (tBytes: Throwable) {
+                        Log.e(TAG, "=== TORRENT INFO PARSE FAILED ===")
+                        Log.e(TAG, "File Size: ${tempFile.length()} bytes")
+                        Log.e(TAG, "File Exception: ${tFile.javaClass.name}: ${tFile.message}")
+                        Log.e(TAG, "Bytes Exception: ${tBytes.javaClass.name}: ${tBytes.message}")
+                        Log.e(TAG, "Cause: ${tBytes.cause?.javaClass?.name}: ${tBytes.cause?.message}")
+                        tBytes.printStackTrace()
+                        throw tBytes
                     }
-                    logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = errPair.second)
-                    return@launch
+                }
+
+                if (!ti.isValid) {
+                    throw IllegalArgumentException("Torrent meta verisi doğrulanamadı (isValid=false)")
                 }
 
                 activeTorrentInfo = ti
@@ -349,6 +414,10 @@ object TorrentDownloadManager {
                     )
                 }
                 logTorrentSnapshot(stateOverride = TorrentState.ERROR.name, errorOverride = desc)
+            } finally {
+                try {
+                    if (tempFile.exists()) tempFile.delete()
+                } catch (_: Exception) {}
             }
         }
     }
